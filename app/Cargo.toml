@@ -9,14 +9,15 @@ publish = false
 axum = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }
 serde = { version = "1", features = ["derive"] }
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "macros", "migrate"] }
+serde_json = "1"
+serde_yaml_ng = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "macros", "migrate", "json"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tempfile = "3"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
-serde_json = "1"
 
 [profile.release]
 strip = true

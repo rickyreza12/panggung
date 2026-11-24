@@ -1,10 +1,18 @@
 mod catalog;
+mod catalog_repository;
 mod config;
 mod database;
 mod storage;
 
-use axum::{Router, extract::State, http::StatusCode, response::Html, routing::get};
-use std::net::Ipv4Addr;
+use axum::{
+    Router,
+    extract::{DefaultBodyLimit, State},
+    http::StatusCode,
+    response::Html,
+    routing::get,
+};
+use catalog_repository::{CatalogState, SqliteCatalogRepository};
+use std::{net::Ipv4Addr, sync::Arc};
 use tokio::net::TcpListener;
 
 #[tokio::main]
@@ -14,40 +22,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
     let config = config::Config::load()?;
     std::fs::create_dir_all(&config.data_dir)?;
-    let storage = storage::LocalStorage::open(config.data_dir.join("objects"))?;
-    let pool = database::open(&config.data_dir.join("panggung.db")).await?;
+    let storage = match config.storage_provider {
+        config::ObjectStorageProvider::Local => {
+            storage::LocalStorage::open(config.data_dir.join("objects"))?
+        }
+    };
+    let repository: CatalogState = match config.database_provider {
+        config::DatabaseProvider::Sqlite => Arc::new(SqliteCatalogRepository::new(
+            database::open(&config.data_dir.join("panggung.db")).await?,
+        )),
+    };
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, config.port)).await?;
     println!("Panggung listening on http://{}", listener.local_addr()?);
-    axum::serve(listener, router(pool).merge(storage.routes()))
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await?;
+    axum::serve(
+        listener,
+        repository_router(repository).merge(storage.routes()),
+    )
+    .with_graceful_shutdown(async {
+        let _ = tokio::signal::ctrl_c().await;
+    })
+    .await?;
     Ok(())
 }
 
+#[cfg(test)]
 fn router(pool: sqlx::SqlitePool) -> Router {
+    repository_router(Arc::new(SqliteCatalogRepository::new(pool)))
+}
+
+fn repository_router(repository: CatalogState) -> Router {
     Router::new()
         .route("/", get(|| async { Html(include_str!("index.html")) }))
         .route("/health", get(|| async { "ok" }))
         .route("/ready", get(ready))
         .route("/api/components", get(catalog::list).post(catalog::create))
-        .route("/api/catalog/import", axum::routing::post(catalog::import))
+        .route(
+            "/api/catalog/import",
+            axum::routing::post(catalog::import).layer(DefaultBodyLimit::max(64 * 1024)),
+        )
+        .route(
+            "/api/catalog/import/yaml",
+            axum::routing::post(catalog::import_yaml).layer(DefaultBodyLimit::max(64 * 1024)),
+        )
         .route(
             "/api/components/{name}",
             get(catalog::get_one)
                 .put(catalog::update)
                 .delete(catalog::remove),
         )
-        .with_state(pool)
+        .with_state(repository)
 }
 
-async fn ready(State(pool): State<sqlx::SqlitePool>) -> (StatusCode, &'static str) {
-    match sqlx::query_scalar::<_, i64>("SELECT 1")
-        .fetch_one(&pool)
-        .await
-    {
-        Ok(1) => (StatusCode::OK, "ready"),
+async fn ready(State(repository): State<CatalogState>) -> (StatusCode, &'static str) {
+    match repository.ready().await {
+        Ok(()) => (StatusCode::OK, "ready"),
         _ => (StatusCode::SERVICE_UNAVAILABLE, "database unavailable"),
     }
 }
@@ -85,6 +113,52 @@ mod tests {
             status,
             serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
         )
+    }
+
+    #[tokio::test]
+    async fn yaml_http_import_preserves_descriptor_and_enforces_body_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = router(database::open(&dir.path().join("test.db")).await.unwrap());
+        let yaml = "apiVersion: backstage.io/v1alpha1\nkind: Component\nmetadata:\n  name: billing\n  tags: [finance, rust]\nspec:\n  type: service\n  lifecycle: production\n  owner: team-a\n";
+        let imported = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/catalog/import/yaml")
+                    .header("content-type", "application/yaml")
+                    .body(Body::from(yaml))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(imported.status(), StatusCode::CREATED);
+        let (status, result) = call(
+            &app,
+            "GET",
+            "/api/components/billing",
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            result["descriptor"]["metadata"]["tags"],
+            serde_json::json!(["finance", "rust"])
+        );
+        assert_eq!(result["component_type"], "service");
+        assert_eq!(result["lifecycle"], "production");
+
+        let oversized = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/catalog/import/yaml")
+                    .body(Body::from(vec![b'a'; 64 * 1024 + 1]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[tokio::test]

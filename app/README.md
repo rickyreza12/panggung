@@ -2,6 +2,8 @@
 
 Initial development target: a local-only Rust developer portal. No production authentication or remote provider support yet. Run cargo run from this directory; tests use isolated data. See the repository README and roadmap.
 
+Configuration: `PANGGUNG_PORT` defaults to `3000`, `PANGGUNG_DATA_DIR` defaults to `data`, `PANGGUNG_DATABASE_PROVIDER` defaults to `sqlite`, and `PANGGUNG_STORAGE_PROVIDER` defaults to `local`. Unsupported provider values fail startup; remote providers are not implemented. The application listens only on loopback.
+
 References: https://docs.rs/axum/0.8/axum/ ; https://docs.rs/tokio/1/tokio/ ; https://docs.rs/sqlx/0.8/sqlx/ ; https://www.sqlite.org/lang.html .
 
 ## Local interface
@@ -9,7 +11,9 @@ References: https://docs.rs/axum/0.8/axum/ ; https://docs.rs/tokio/1/tokio/ ; ht
 - GET /api/components lists up to 500 records; q filters name, description and owner (ASCII case-insensitive); offset selects a page.
 - POST /api/components registers a component with name, description and owner.
 - GET, PUT and DELETE /api/components/{name} retrieve, update and delete a record. Names are immutable.
-- POST /api/catalog/import accepts one JSON Backstage Component descriptor with apiVersion backstage.io/v1alpha1 and default namespace only. It stores name, description and owner; type and lifecycle are required but not yet persisted. Other metadata and relationships are not imported. YAML and remote ingestion are not supported yet.
+- POST /api/catalog/import accepts one JSON Backstage Component descriptor with apiVersion backstage.io/v1alpha1. POST /api/catalog/import/yaml accepts a single UTF-8 YAML descriptor. Both validate the same subset and reject duplicate names, unsupported kinds and versions, non-default namespaces, unresolved external substitutions and malformed known metadata fields. The descriptor is limited to 64 KiB of serialized JSON (and YAML input is limited to 64 KiB).
+- Component responses retain name, description and owner and additionally include namespace, component_type, lifecycle and descriptor. Imported descriptors retain JSON-compatible metadata (including annotations, labels, tags, links), specification fields and extensions; supported description and owner updates also update the stored descriptor. Legacy rows and manual registrations retain their original data and have null type, lifecycle and descriptor. The additive migration does not invent missing metadata.
+- Import supports the default namespace only and the existing lowercase letter, digit and hyphen name rules. Links must use HTTP or HTTPS. Relationship references are stored as data; they are not resolved into a graph. Full Backstage schema validation, multi-document YAML, remote ingestion, namespace-qualified identities and external substitutions remain outside this subset. No descriptor link is fetched during import.
 - PUT and GET /api/objects/{key} create and retrieve immutable binary objects (32 lowercase hexadecimal characters per key, maximum 1 MiB per object). Duplicate keys return conflict. Objects reside in the objects directory under PANGGUNG_DATA_DIR. No deletion or quota management yet. Keep this directory private to the application account.
 
 The descriptor reference is https://backstage.io/docs/features/software-catalog/descriptor-format/ . These endpoints are local development interfaces, not Backstage-compatible web endpoints or authenticated production interfaces.

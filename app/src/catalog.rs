@@ -1,16 +1,21 @@
+use crate::catalog_repository::{CatalogRepository, CatalogState, RepositoryError};
 use axum::{
     Json,
     extract::{Path, Query, State},
     http::StatusCode,
 };
 use serde::{Deserialize, Serialize};
-use sqlx::SqlitePool;
+use serde_json::Value;
 
-#[derive(Debug, Serialize, sqlx::FromRow)]
+#[derive(Debug, Serialize)]
 pub struct Component {
     pub name: String,
     pub description: String,
     pub owner: String,
+    pub namespace: String,
+    pub component_type: Option<String>,
+    pub lifecycle: Option<String>,
+    pub descriptor: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -21,11 +26,10 @@ pub struct NewComponent {
 }
 
 type ApiError = (StatusCode, &'static str);
+const MAX_DESCRIPTOR_BYTES: usize = 64 * 1024;
 
-fn internal(error: sqlx::Error) -> ApiError {
-    if let sqlx::Error::Database(ref db) = error
-        && db.is_unique_violation()
-    {
+fn internal(error: RepositoryError) -> ApiError {
+    if matches!(error, RepositoryError::Conflict) {
         return (StatusCode::CONFLICT, "Component already exists");
     }
     tracing::error!("Catalog database operation failed");
@@ -44,25 +48,27 @@ pub struct Filter {
 }
 
 pub async fn list(
-    State(pool): State<SqlitePool>,
+    State(repository): State<CatalogState>,
     Query(filter): Query<Filter>,
 ) -> Result<Json<Vec<Component>>, ApiError> {
     if filter.q.len() > 200 {
         return Err((StatusCode::BAD_REQUEST, "Search term too long"));
     }
-    sqlx::query_as("SELECT name, description, owner FROM components WHERE instr(lower(name || ' ' || description || ' ' || owner), lower(?)) > 0 OR ? = '' ORDER BY name LIMIT 500 OFFSET ?")
-        .bind(&filter.q).bind(&filter.q).bind(filter.offset)
-        .fetch_all(&pool)
+    repository
+        .list(&filter.q, filter.offset)
         .await
         .map(Json)
         .map_err(internal)
 }
 
 pub async fn create(
-    State(pool): State<SqlitePool>,
+    State(repository): State<CatalogState>,
     Json(input): Json<NewComponent>,
 ) -> Result<(StatusCode, Json<Component>), ApiError> {
-    let component = insert(&pool, input).await?;
+    let component = repository
+        .insert(validate(input)?)
+        .await
+        .map_err(internal)?;
     Ok((StatusCode::CREATED, Json(component)))
 }
 
@@ -87,28 +93,19 @@ fn validate(input: NewComponent) -> Result<Component, ApiError> {
         name: name.into(),
         description: description.into(),
         owner: owner.into(),
+        namespace: "default".into(),
+        component_type: None,
+        lifecycle: None,
+        descriptor: None,
     })
 }
 
-async fn insert(pool: &SqlitePool, input: NewComponent) -> Result<Component, ApiError> {
-    let component = validate(input)?;
-    sqlx::query("INSERT INTO components (name, description, owner) VALUES (?, ?, ?)")
-        .bind(&component.name)
-        .bind(&component.description)
-        .bind(&component.owner)
-        .execute(pool)
-        .await
-        .map_err(internal)?;
-    Ok(component)
-}
-
 pub async fn get_one(
-    State(pool): State<SqlitePool>,
+    State(repository): State<CatalogState>,
     Path(name): Path<String>,
 ) -> Result<Json<Component>, ApiError> {
-    sqlx::query_as("SELECT name, description, owner FROM components WHERE name = ?")
-        .bind(name)
-        .fetch_optional(&pool)
+    repository
+        .get(&name)
         .await
         .map_err(internal)?
         .map(Json)
@@ -116,7 +113,7 @@ pub async fn get_one(
 }
 
 pub async fn update(
-    State(pool): State<SqlitePool>,
+    State(repository): State<CatalogState>,
     Path(name): Path<String>,
     Json(input): Json<NewComponent>,
 ) -> Result<Json<Component>, ApiError> {
@@ -124,29 +121,19 @@ pub async fn update(
     if name != component.name {
         return Err((StatusCode::BAD_REQUEST, "Component names cannot be changed"));
     }
-    let result = sqlx::query("UPDATE components SET description = ?, owner = ? WHERE name = ?")
-        .bind(&component.description)
-        .bind(&component.owner)
-        .bind(name)
-        .execute(&pool)
+    repository
+        .update(&name, &component.description, &component.owner)
         .await
-        .map_err(internal)?;
-    if result.rows_affected() == 0 {
-        return Err((StatusCode::NOT_FOUND, "Component not found"));
-    }
-    Ok(Json(component))
+        .map_err(internal)?
+        .map(Json)
+        .ok_or((StatusCode::NOT_FOUND, "Component not found"))
 }
 
 pub async fn remove(
-    State(pool): State<SqlitePool>,
+    State(repository): State<CatalogState>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    let result = sqlx::query("DELETE FROM components WHERE name = ?")
-        .bind(name)
-        .execute(&pool)
-        .await
-        .map_err(internal)?;
-    if result.rows_affected() == 0 {
+    if !repository.remove(&name).await.map_err(internal)? {
         return Err((StatusCode::NOT_FOUND, "Component not found"));
     }
     Ok(StatusCode::NO_CONTENT)
@@ -154,7 +141,7 @@ pub async fn remove(
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct Descriptor {
+struct Descriptor {
     api_version: String,
     kind: String,
     metadata: Metadata,
@@ -179,9 +166,42 @@ struct Spec {
 }
 
 pub async fn import(
-    State(pool): State<SqlitePool>,
-    Json(input): Json<Descriptor>,
+    State(repository): State<CatalogState>,
+    Json(document): Json<Value>,
 ) -> Result<(StatusCode, Json<Component>), ApiError> {
+    import_document(repository.as_ref(), document).await
+}
+
+pub async fn import_yaml(
+    State(repository): State<CatalogState>,
+    body: String,
+) -> Result<(StatusCode, Json<Component>), ApiError> {
+    if body.len() > MAX_DESCRIPTOR_BYTES {
+        return Err((StatusCode::PAYLOAD_TOO_LARGE, "Descriptor too large"));
+    }
+    let document = serde_yaml_ng::from_str(&body)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid YAML descriptor"))?;
+    import_document(repository.as_ref(), document).await
+}
+
+async fn import_document(
+    repository: &dyn CatalogRepository,
+    document: Value,
+) -> Result<(StatusCode, Json<Component>), ApiError> {
+    let component = validate_descriptor(document)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(repository.insert(component).await.map_err(internal)?),
+    ))
+}
+
+fn validate_descriptor(mut document: Value) -> Result<Component, ApiError> {
+    let invalid = (StatusCode::BAD_REQUEST, "Invalid component descriptor");
+    reject_substitutions(&document, 0)?;
+    if document.to_string().len() > MAX_DESCRIPTOR_BYTES {
+        return Err((StatusCode::PAYLOAD_TOO_LARGE, "Descriptor too large"));
+    }
+    let input: Descriptor = serde_json::from_value(document.clone()).map_err(|_| invalid)?;
     if input.api_version != "backstage.io/v1alpha1"
         || input.kind != "Component"
         || input
@@ -190,18 +210,286 @@ pub async fn import(
             .as_deref()
             .is_some_and(|ns| ns != "default")
         || input.spec.component_type.trim().is_empty()
+        || input.spec.component_type.len() > 100
         || input.spec.lifecycle.trim().is_empty()
+        || input.spec.lifecycle.len() > 100
     {
         return Err((StatusCode::BAD_REQUEST, "Unsupported component descriptor"));
     }
-    let component = insert(
-        &pool,
-        NewComponent {
-            name: input.metadata.name,
-            description: input.metadata.description,
-            owner: input.spec.owner,
-        },
-    )
-    .await?;
-    Ok((StatusCode::CREATED, Json(component)))
+    validate_metadata(&document["metadata"])?;
+    validate_spec(&document["spec"])?;
+    let mut component = validate(NewComponent {
+        name: input.metadata.name,
+        description: input.metadata.description,
+        owner: input.spec.owner,
+    })?;
+    component.component_type = Some(input.spec.component_type);
+    component.lifecycle = Some(input.spec.lifecycle);
+    document["metadata"]["name"] = Value::String(component.name.clone());
+    if document["metadata"].get("description").is_some() {
+        document["metadata"]["description"] = Value::String(component.description.clone());
+    }
+    document["spec"]["owner"] = Value::String(component.owner.clone());
+    component.descriptor = Some(document);
+    Ok(component)
+}
+
+fn validate_metadata(metadata: &Value) -> Result<(), ApiError> {
+    let invalid = (StatusCode::BAD_REQUEST, "Invalid descriptor metadata");
+    for field in ["annotations", "labels"] {
+        if let Some(value) = metadata.get(field)
+            && !value
+                .as_object()
+                .is_some_and(|map| map.values().all(Value::is_string))
+        {
+            return Err(invalid);
+        }
+    }
+    if let Some(tags) = metadata.get("tags")
+        && !tags
+            .as_array()
+            .is_some_and(|items| items.iter().all(Value::is_string))
+    {
+        return Err(invalid);
+    }
+    if let Some(links) = metadata.get("links")
+        && !links
+            .as_array()
+            .is_some_and(|items| items.iter().all(valid_link))
+    {
+        return Err(invalid);
+    }
+    for field in ["title", "namespace"] {
+        if let Some(value) = metadata.get(field)
+            && !value.is_string()
+        {
+            return Err(invalid);
+        }
+    }
+    Ok(())
+}
+
+fn validate_spec(spec: &Value) -> Result<(), ApiError> {
+    let invalid = (StatusCode::BAD_REQUEST, "Invalid descriptor specification");
+    for field in ["system", "subcomponentOf"] {
+        if let Some(value) = spec.get(field)
+            && value.as_str().is_none_or(|value| value.trim().is_empty())
+        {
+            return Err(invalid);
+        }
+    }
+    for field in ["providesApis", "consumesApis", "dependsOn", "dependencyOf"] {
+        if let Some(value) = spec.get(field)
+            && !value.as_array().is_some_and(|items| {
+                items
+                    .iter()
+                    .all(|item| item.as_str().is_some_and(|value| !value.trim().is_empty()))
+            })
+        {
+            return Err(invalid);
+        }
+    }
+    Ok(())
+}
+
+fn valid_link(link: &Value) -> bool {
+    link.get("url").and_then(Value::as_str).is_some_and(|url| {
+        url.strip_prefix("https://")
+            .or_else(|| url.strip_prefix("http://"))
+            .is_some_and(|rest| !rest.is_empty() && !rest.starts_with(['/', '?', '#']))
+            && !url.contains(char::is_whitespace)
+    }) && ["title", "icon", "type"]
+        .iter()
+        .all(|field| link.get(field).is_none_or(Value::is_string))
+}
+
+fn reject_substitutions(value: &Value, depth: usize) -> Result<(), ApiError> {
+    let invalid = (
+        StatusCode::BAD_REQUEST,
+        "Unsupported descriptor nesting or substitution",
+    );
+    if depth > 32 {
+        return Err(invalid);
+    }
+    match value {
+        Value::Object(map) => {
+            for (key, value) in map {
+                if matches!(key.as_str(), "$text" | "$json" | "$yaml") {
+                    return Err(invalid);
+                }
+                reject_substitutions(value, depth + 1)?;
+            }
+        }
+        Value::Array(items) => {
+            for value in items {
+                reject_substitutions(value, depth + 1)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog_repository::SqliteCatalogRepository;
+    use serde_json::json;
+    use sqlx::SqlitePool;
+    use std::sync::Arc;
+
+    fn state(pool: SqlitePool) -> CatalogState {
+        Arc::new(SqliteCatalogRepository::new(pool))
+    }
+
+    fn descriptor() -> Value {
+        json!({
+            "apiVersion": "backstage.io/v1alpha1",
+            "kind": "Component",
+            "metadata": {
+                "name": "billing", "description": "Billing service",
+                "annotations": {"example.com/repository": "billing"},
+                "labels": {"tier": "backend"}, "tags": ["rust"],
+                "links": [{"url": "https://example.com/billing", "title": "Billing"}],
+                "custom": {"priority": 2}
+            },
+            "spec": {"type": "service", "lifecycle": "production", "owner": "team-a", "dependsOn": ["resource:database"]}
+        })
+    }
+
+    #[tokio::test]
+    async fn descriptor_survives_storage_and_legacy_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("catalog.db");
+        let pool = crate::database::open(&path).await.unwrap();
+        let document = descriptor();
+        let (status, Json(created)) =
+            import_document(state(pool.clone()).as_ref(), document.clone())
+                .await
+                .unwrap();
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(created.descriptor.unwrap(), document);
+        assert_eq!(created.component_type.as_deref(), Some("service"));
+        assert_eq!(created.lifecycle.as_deref(), Some("production"));
+        pool.close().await;
+        let pool = crate::database::open(&path).await.unwrap();
+        let Json(reopened) = get_one(State(state(pool.clone())), Path("billing".into()))
+            .await
+            .unwrap();
+        assert_eq!(reopened.descriptor.unwrap(), document);
+        let Json(updated) = update(
+            State(state(pool)),
+            Path("billing".into()),
+            Json(NewComponent {
+                name: "billing".into(),
+                description: "Updated".into(),
+                owner: "team-b".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        let mut expected = document;
+        expected["metadata"]["description"] = json!("Updated");
+        expected["spec"]["owner"] = json!("team-b");
+        assert_eq!(updated.descriptor.unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn additive_migration_preserves_legacy_components() {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::raw_sql(include_str!("../migrations/0001_catalog.sql"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO components (name, description, owner) VALUES ('legacy', 'old', 'team')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(include_str!("../migrations/0002_catalog_metadata.sql"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let Json(legacy) = get_one(State(state(pool)), Path("legacy".into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            (&*legacy.description, &*legacy.owner, &*legacy.namespace),
+            ("old", "team", "default")
+        );
+        assert!(
+            legacy.component_type.is_none()
+                && legacy.lifecycle.is_none()
+                && legacy.descriptor.is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn yaml_import_uses_same_validation_and_preserves_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = crate::database::open(&dir.path().join("catalog.db"))
+            .await
+            .unwrap();
+        let yaml = "apiVersion: backstage.io/v1alpha1\nkind: Component\nmetadata:\n  name: billing\n  tags: [rust]\nspec:\n  type: service\n  lifecycle: production\n  owner: team-a\n";
+        let (_, Json(created)) = import_yaml(State(state(pool.clone())), yaml.into())
+            .await
+            .unwrap();
+        assert_eq!(
+            created.descriptor.unwrap()["metadata"]["tags"],
+            json!(["rust"])
+        );
+        assert_eq!(
+            import_yaml(State(state(pool.clone())), yaml.into())
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            import_yaml(State(state(pool.clone())), format!("{yaml}---\n{yaml}"))
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            import_yaml(State(state(pool)), "metadata: [".into())
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn descriptor_validation_rejects_unsupported_and_invalid_fields() {
+        for (field, value) in [
+            ("namespace", json!("other")),
+            ("namespace", Value::Null),
+            ("annotations", json!({"bad": 42})),
+            ("tags", json!("rust")),
+            ("links", json!([{"url": "javascript:alert(1)"}])),
+            ("links", json!([{"url": "https://"}])),
+        ] {
+            let mut document = descriptor();
+            document["metadata"][field] = value;
+            assert_eq!(
+                validate_descriptor(document).unwrap_err().0,
+                StatusCode::BAD_REQUEST
+            );
+        }
+        let mut document = descriptor();
+        document["spec"]["owner"] = json!({"$text": "https://example.com/team"});
+        assert_eq!(
+            validate_descriptor(document).unwrap_err().0,
+            StatusCode::BAD_REQUEST
+        );
+        let mut document = descriptor();
+        document["metadata"]["custom"] = json!("x".repeat(MAX_DESCRIPTOR_BYTES));
+        assert_eq!(
+            validate_descriptor(document).unwrap_err().0,
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+    }
 }
