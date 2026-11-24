@@ -27,6 +27,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             storage::LocalStorage::open(config.data_dir.join("objects"))?
         }
     };
+    storage::validate_capabilities(&storage)?;
     let repository: CatalogState = match config.database_provider {
         config::DatabaseProvider::Sqlite => Arc::new(SqliteCatalogRepository::new(
             database::open(&config.data_dir.join("panggung.db")).await?,
@@ -69,6 +70,12 @@ fn repository_router(repository: CatalogState) -> Router {
             get(catalog::get_one)
                 .put(catalog::update)
                 .delete(catalog::remove),
+        )
+        .route(
+            "/api/components/{namespace}/{name}",
+            get(catalog::get_qualified)
+                .put(catalog::update_qualified)
+                .delete(catalog::remove_qualified),
         )
         .with_state(repository)
 }
@@ -162,6 +169,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn qualified_namespace_routes_isolate_same_named_components() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = router(database::open(&dir.path().join("test.db")).await.unwrap());
+        let mut descriptor = serde_json::json!({
+            "apiVersion": "backstage.io/v1alpha1",
+            "kind": "Component",
+            "metadata": {"name": "shared"},
+            "spec": {"type": "service", "lifecycle": "production", "owner": "default-team"}
+        });
+        assert_eq!(
+            call(&app, "POST", "/api/catalog/import", descriptor.clone())
+                .await
+                .0,
+            StatusCode::CREATED
+        );
+        descriptor["metadata"]["namespace"] = "team-x".into();
+        descriptor["spec"]["owner"] = "team-x-owner".into();
+        assert_eq!(
+            call(&app, "POST", "/api/catalog/import", descriptor.clone())
+                .await
+                .0,
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            call(&app, "POST", "/api/catalog/import", descriptor)
+                .await
+                .0,
+            StatusCode::CONFLICT
+        );
+        let (_, default) = call(
+            &app,
+            "GET",
+            "/api/components/shared",
+            serde_json::Value::Null,
+        )
+        .await;
+        let (_, qualified) = call(
+            &app,
+            "GET",
+            "/api/components/team-x/shared",
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(default["owner"], "default-team");
+        assert_eq!(qualified["owner"], "team-x-owner");
+        let (status, filtered) = call(
+            &app,
+            "GET",
+            "/api/components?namespace=team-x&limit=1",
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(filtered.as_array().unwrap().len(), 1);
+        assert_eq!(filtered[0]["namespace"], "team-x");
+        let update = serde_json::json!({
+            "name": "shared", "description": "New", "owner": "team-x-updated"
+        });
+        assert_eq!(
+            call(&app, "PUT", "/api/components/team-x/shared", update)
+                .await
+                .0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            call(
+                &app,
+                "DELETE",
+                "/api/components/team-x/shared",
+                serde_json::Value::Null
+            )
+            .await
+            .0,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            call(
+                &app,
+                "GET",
+                "/api/components/shared",
+                serde_json::Value::Null
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
     async fn catalog_import_filter_edit_delete() {
         let dir = tempfile::tempdir().unwrap();
         let app = router(database::open(&dir.path().join("test.db")).await.unwrap());
@@ -179,7 +275,7 @@ mod tests {
             StatusCode::CONFLICT
         );
         let mut invalid = descriptor;
-        invalid["metadata"]["namespace"] = "other".into();
+        invalid["metadata"]["namespace"] = "Other".into();
         assert_eq!(
             call(&app, "POST", "/api/catalog/import", invalid).await.0,
             StatusCode::BAD_REQUEST

@@ -27,6 +27,12 @@ pub struct NewComponent {
 
 type ApiError = (StatusCode, &'static str);
 const MAX_DESCRIPTOR_BYTES: usize = 64 * 1024;
+const DEFAULT_NAMESPACE: &str = "default";
+const MAX_PAGE_SIZE: u32 = 500;
+
+fn default_limit() -> u32 {
+    MAX_PAGE_SIZE
+}
 
 fn internal(error: RepositoryError) -> ApiError {
     if matches!(error, RepositoryError::Conflict) {
@@ -45,6 +51,9 @@ pub struct Filter {
     q: String,
     #[serde(default)]
     offset: u32,
+    namespace: Option<String>,
+    #[serde(default = "default_limit")]
+    limit: u32,
 }
 
 pub async fn list(
@@ -54,8 +63,19 @@ pub async fn list(
     if filter.q.len() > 200 {
         return Err((StatusCode::BAD_REQUEST, "Search term too long"));
     }
+    if !(1..=MAX_PAGE_SIZE).contains(&filter.limit) {
+        return Err((StatusCode::BAD_REQUEST, "Invalid page limit"));
+    }
+    if let Some(namespace) = &filter.namespace {
+        validate_namespace(namespace)?;
+    }
     repository
-        .list(&filter.q, filter.offset)
+        .list(
+            &filter.q,
+            filter.namespace.as_deref(),
+            filter.offset,
+            filter.limit,
+        )
         .await
         .map(Json)
         .map_err(internal)
@@ -93,19 +113,41 @@ fn validate(input: NewComponent) -> Result<Component, ApiError> {
         name: name.into(),
         description: description.into(),
         owner: owner.into(),
-        namespace: "default".into(),
+        namespace: DEFAULT_NAMESPACE.into(),
         component_type: None,
         lifecycle: None,
         descriptor: None,
     })
 }
 
+fn validate_namespace(namespace: &str) -> Result<(), ApiError> {
+    if namespace.is_empty()
+        || namespace.len() > 63
+        || !namespace.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_' | b'.')
+        })
+        || !namespace.as_bytes()[0].is_ascii_alphanumeric()
+        || !namespace.as_bytes()[namespace.len() - 1].is_ascii_alphanumeric()
+    {
+        return Err((StatusCode::BAD_REQUEST, "Invalid namespace"));
+    }
+    Ok(())
+}
+
 pub async fn get_one(
     State(repository): State<CatalogState>,
     Path(name): Path<String>,
 ) -> Result<Json<Component>, ApiError> {
+    get_qualified(State(repository), Path((DEFAULT_NAMESPACE.into(), name))).await
+}
+
+pub async fn get_qualified(
+    State(repository): State<CatalogState>,
+    Path((namespace, name)): Path<(String, String)>,
+) -> Result<Json<Component>, ApiError> {
+    validate_namespace(&namespace)?;
     repository
-        .get(&name)
+        .get(&namespace, &name)
         .await
         .map_err(internal)?
         .map(Json)
@@ -117,12 +159,26 @@ pub async fn update(
     Path(name): Path<String>,
     Json(input): Json<NewComponent>,
 ) -> Result<Json<Component>, ApiError> {
+    update_qualified(
+        State(repository),
+        Path((DEFAULT_NAMESPACE.into(), name)),
+        Json(input),
+    )
+    .await
+}
+
+pub async fn update_qualified(
+    State(repository): State<CatalogState>,
+    Path((namespace, name)): Path<(String, String)>,
+    Json(input): Json<NewComponent>,
+) -> Result<Json<Component>, ApiError> {
+    validate_namespace(&namespace)?;
     let component = validate(input)?;
     if name != component.name {
         return Err((StatusCode::BAD_REQUEST, "Component names cannot be changed"));
     }
     repository
-        .update(&name, &component.description, &component.owner)
+        .update(&namespace, &name, &component.description, &component.owner)
         .await
         .map_err(internal)?
         .map(Json)
@@ -133,7 +189,19 @@ pub async fn remove(
     State(repository): State<CatalogState>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    if !repository.remove(&name).await.map_err(internal)? {
+    remove_qualified(State(repository), Path((DEFAULT_NAMESPACE.into(), name))).await
+}
+
+pub async fn remove_qualified(
+    State(repository): State<CatalogState>,
+    Path((namespace, name)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    validate_namespace(&namespace)?;
+    if !repository
+        .remove(&namespace, &name)
+        .await
+        .map_err(internal)?
+    {
         return Err((StatusCode::NOT_FOUND, "Component not found"));
     }
     Ok(StatusCode::NO_CONTENT)
@@ -204,11 +272,6 @@ fn validate_descriptor(mut document: Value) -> Result<Component, ApiError> {
     let input: Descriptor = serde_json::from_value(document.clone()).map_err(|_| invalid)?;
     if input.api_version != "backstage.io/v1alpha1"
         || input.kind != "Component"
-        || input
-            .metadata
-            .namespace
-            .as_deref()
-            .is_some_and(|ns| ns != "default")
         || input.spec.component_type.trim().is_empty()
         || input.spec.component_type.len() > 100
         || input.spec.lifecycle.trim().is_empty()
@@ -218,11 +281,17 @@ fn validate_descriptor(mut document: Value) -> Result<Component, ApiError> {
     }
     validate_metadata(&document["metadata"])?;
     validate_spec(&document["spec"])?;
+    let namespace = input
+        .metadata
+        .namespace
+        .unwrap_or_else(|| DEFAULT_NAMESPACE.into());
+    validate_namespace(&namespace)?;
     let mut component = validate(NewComponent {
         name: input.metadata.name,
         description: input.metadata.description,
         owner: input.spec.owner,
     })?;
+    component.namespace = namespace;
     component.component_type = Some(input.spec.component_type);
     component.lifecycle = Some(input.spec.lifecycle);
     document["metadata"]["name"] = Value::String(component.name.clone());
@@ -411,6 +480,27 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        let original = r#"{ "metadata": {"name":"billing"}, "spec": {"type":"service","owner":"team","lifecycle":"production"} }"#;
+        sqlx::query("INSERT INTO components (name, description, owner, component_type, lifecycle, descriptor) VALUES ('billing', 'billing service', 'team', 'service', 'production', ?)")
+            .bind(original).execute(&pool).await.unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::raw_sql(include_str!("../migrations/0003_catalog_namespaces.sql"))
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let raw: String = sqlx::query_scalar(
+            "SELECT descriptor FROM components WHERE namespace = 'default' AND name = 'billing'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(raw, original);
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM components")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 2);
         let Json(legacy) = get_one(State(state(pool)), Path("legacy".into()))
             .await
             .unwrap();
@@ -426,15 +516,166 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn namespace_identity_isolation_and_pagination() {
+        let dir = tempfile::tempdir().unwrap();
+        let repository = state(
+            crate::database::open(&dir.path().join("catalog.db"))
+                .await
+                .unwrap(),
+        );
+        let default_document = descriptor();
+        let (status, Json(_)) = import_document(repository.as_ref(), default_document.clone())
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::CREATED);
+        let mut other_document = descriptor();
+        other_document["metadata"]["namespace"] = json!("platform.dev");
+        other_document["spec"]["owner"] = json!("team-other");
+        let (status, Json(_)) = import_document(repository.as_ref(), other_document.clone())
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(
+            import_document(repository.as_ref(), other_document.clone())
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::CONFLICT
+        );
+        let yaml = serde_yaml_ng::to_string(&other_document).unwrap();
+        assert_eq!(
+            import_yaml(State(repository.clone()), yaml)
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::CONFLICT
+        );
+        let Json(default) = get_one(State(repository.clone()), Path("billing".into()))
+            .await
+            .unwrap();
+        assert_eq!(default.descriptor.unwrap(), default_document);
+        let Json(other) = get_qualified(
+            State(repository.clone()),
+            Path(("platform.dev".into(), "billing".into())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(other.descriptor.unwrap(), other_document);
+        let Json(updated) = update_qualified(
+            State(repository.clone()),
+            Path(("platform.dev".into(), "billing".into())),
+            Json(NewComponent {
+                name: "billing".into(),
+                description: "changed".into(),
+                owner: "new-owner".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        other_document["metadata"]["description"] = json!("changed");
+        other_document["spec"]["owner"] = json!("new-owner");
+        assert_eq!(updated.descriptor.unwrap(), other_document);
+        let Json(default) = get_one(State(repository.clone()), Path("billing".into()))
+            .await
+            .unwrap();
+        assert_eq!(default.descriptor.unwrap(), default_document);
+        for (offset, expected) in [(0, "default"), (1, "platform.dev")] {
+            let Json(page) = list(
+                State(repository.clone()),
+                Query(Filter {
+                    q: "billing".into(),
+                    offset,
+                    namespace: None,
+                    limit: 1,
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(page.len(), 1);
+            assert_eq!(page[0].namespace, expected);
+        }
+        let Json(page) = list(
+            State(repository.clone()),
+            Query(Filter {
+                q: "".into(),
+                offset: 0,
+                namespace: Some("platform.dev".into()),
+                limit: 500,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].namespace, "platform.dev");
+        for limit in [0, 501] {
+            assert_eq!(
+                list(
+                    State(repository.clone()),
+                    Query(Filter {
+                        q: "".into(),
+                        offset: 0,
+                        namespace: None,
+                        limit
+                    })
+                )
+                .await
+                .unwrap_err()
+                .0,
+                StatusCode::BAD_REQUEST
+            );
+        }
+        assert_eq!(
+            remove(State(repository.clone()), Path("billing".into()))
+                .await
+                .unwrap(),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            get_one(State(repository.clone()), Path("billing".into()))
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            remove(State(repository.clone()), Path("billing".into()))
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            remove_qualified(
+                State(repository.clone()),
+                Path(("platform.dev".into(), "billing".into()))
+            )
+            .await
+            .unwrap(),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            get_qualified(
+                State(repository),
+                Path(("platform.dev".into(), "billing".into()))
+            )
+            .await
+            .unwrap_err()
+            .0,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
     async fn yaml_import_uses_same_validation_and_preserves_metadata() {
         let dir = tempfile::tempdir().unwrap();
         let pool = crate::database::open(&dir.path().join("catalog.db"))
             .await
             .unwrap();
-        let yaml = "apiVersion: backstage.io/v1alpha1\nkind: Component\nmetadata:\n  name: billing\n  tags: [rust]\nspec:\n  type: service\n  lifecycle: production\n  owner: team-a\n";
+        let yaml = "apiVersion: backstage.io/v1alpha1\nkind: Component\nmetadata:\n  name: billing\n  namespace: platform\n  tags: [rust]\nspec:\n  type: service\n  lifecycle: production\n  owner: team-a\n";
         let (_, Json(created)) = import_yaml(State(state(pool.clone())), yaml.into())
             .await
             .unwrap();
+        assert_eq!(created.namespace, "platform");
         assert_eq!(
             created.descriptor.unwrap()["metadata"]["tags"],
             json!(["rust"])
@@ -465,7 +706,9 @@ mod tests {
     #[test]
     fn descriptor_validation_rejects_unsupported_and_invalid_fields() {
         for (field, value) in [
-            ("namespace", json!("other")),
+            ("namespace", json!("Other")),
+            ("namespace", json!("../other")),
+            ("namespace", json!("")),
             ("namespace", Value::Null),
             ("annotations", json!({"bad": 42})),
             ("tags", json!("rust")),

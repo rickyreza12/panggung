@@ -36,8 +36,36 @@ impl ObjectKey {
 
 // Synchronous operations are run on Tokio's blocking pool by the HTTP adapter.
 pub trait ObjectStore: Send + Sync {
+    fn capabilities(&self) -> StorageCapabilities;
     fn read(&self, key: &ObjectKey) -> io::Result<Vec<u8>>;
     fn write(&self, key: &ObjectKey, data: &[u8]) -> io::Result<()>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StorageCapabilities {
+    /// Creating an existing key fails without replacing its contents.
+    pub immutable_create: bool,
+    /// Largest object supported by the provider, in bytes.
+    pub max_object_bytes: usize,
+}
+
+pub fn validate_capabilities(store: &dyn ObjectStore) -> io::Result<()> {
+    let capabilities = store.capabilities();
+    if !capabilities.immutable_create {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Object storage provider must support immutable create",
+        ));
+    }
+    if capabilities.max_object_bytes < MAX_OBJECT_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "Object storage provider must support objects of at least {MAX_OBJECT_BYTES} bytes"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 pub fn routes(store: Arc<dyn ObjectStore>) -> Router {
@@ -70,6 +98,13 @@ impl LocalStorage {
 }
 
 impl ObjectStore for LocalStorage {
+    fn capabilities(&self) -> StorageCapabilities {
+        StorageCapabilities {
+            immutable_create: true,
+            max_object_bytes: MAX_OBJECT_BYTES,
+        }
+    }
+
     fn read(&self, key: &ObjectKey) -> io::Result<Vec<u8>> {
         let path = self.path(key);
         let metadata = std::fs::symlink_metadata(&path)?;
@@ -148,15 +183,54 @@ mod tests {
     };
     use tower::ServiceExt;
 
-    struct UnavailableStore;
+    struct UnavailableStore(StorageCapabilities);
 
     impl ObjectStore for UnavailableStore {
+        fn capabilities(&self) -> StorageCapabilities {
+            self.0
+        }
+
         fn read(&self, _key: &ObjectKey) -> io::Result<Vec<u8>> {
             Err(io::Error::other("provider unavailable"))
         }
 
         fn write(&self, _key: &ObjectKey, _data: &[u8]) -> io::Result<()> {
             Err(io::Error::other("provider unavailable"))
+        }
+    }
+
+    #[test]
+    fn validates_required_provider_capabilities() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = LocalStorage::open(dir.path().to_owned()).unwrap();
+        assert_eq!(
+            local.capabilities(),
+            StorageCapabilities {
+                immutable_create: true,
+                max_object_bytes: MAX_OBJECT_BYTES,
+            }
+        );
+        validate_capabilities(&local).unwrap();
+
+        for (capabilities, message) in [
+            (
+                StorageCapabilities {
+                    immutable_create: false,
+                    max_object_bytes: MAX_OBJECT_BYTES,
+                },
+                "immutable create",
+            ),
+            (
+                StorageCapabilities {
+                    immutable_create: true,
+                    max_object_bytes: MAX_OBJECT_BYTES - 1,
+                },
+                "at least",
+            ),
+        ] {
+            let error = validate_capabilities(&UnavailableStore(capabilities)).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+            assert!(error.to_string().contains(message));
         }
     }
 
@@ -230,7 +304,12 @@ mod tests {
 
     #[tokio::test]
     async fn unavailable_provider_fails_without_local_fallback() {
-        let app = routes(Arc::new(UnavailableStore));
+        let store = UnavailableStore(StorageCapabilities {
+            immutable_create: true,
+            max_object_bytes: MAX_OBJECT_BYTES,
+        });
+        validate_capabilities(&store).unwrap();
+        let app = routes(Arc::new(store));
         let uri = "/api/objects/0123456789abcdef0123456789abcdef";
         for method in ["GET", "PUT"] {
             let response = app
