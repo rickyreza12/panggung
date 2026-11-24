@@ -1,0 +1,70 @@
+import {useEffect,useRef,useState} from 'react';
+import {errorMessage,json} from './api';
+import type {request} from './api';
+
+interface Repository {github_id:number;owner:string;name:string;description:string|null;default_branch:string;archived:boolean}
+interface Registered extends Repository {descriptor_status:'found'|'missing'|'unsupported';synced_at:number;synced_by:number|null}
+interface Page<T> {items:T[];has_more:boolean}
+const LIMIT=20;
+export default function GitHub({run,write}:{run:typeof request;write:boolean}) {
+  const heading=useRef<HTMLHeadingElement>(null);
+  const [owner,setOwner]=useState('');
+  const [query,setQuery]=useState('');
+  const [page,setPage]=useState(1);
+  const [offset,setOffset]=useState(0);
+  const [discovered,setDiscovered]=useState<Page<Repository>|null>(null);
+  const [registered,setRegistered]=useState<Page<Registered>|null>(null);
+  const [loading,setLoading]=useState(false);
+  const [registryLoading,setRegistryLoading]=useState(true);
+  const [error,setError]=useState('');
+  const [registryError,setRegistryError]=useState('');
+  const [syncError,setSyncError]=useState('');
+  const [notice,setNotice]=useState('');
+  const [busy,setBusy]=useState(false);
+  const [retry,setRetry]=useState(0);
+  const [refresh,setRefresh]=useState(0);
+  useEffect(()=>{heading.current?.focus();},[]);
+  useEffect(()=>{
+    const controller=new AbortController();setError('');setDiscovered(null);
+    if(!query){setLoading(false);return ()=>controller.abort();}
+    setLoading(true);
+    run<Page<Repository>>('/api/github/discover/'+encodeURIComponent(query)+'?'+new URLSearchParams({page:String(page),limit:String(LIMIT)}),{signal:controller.signal})
+      .then(data=>{if(!controller.signal.aborted)setDiscovered(data);})
+      .catch(e=>{if(!controller.signal.aborted)setError(errorMessage(e));})
+      .finally(()=>{if(!controller.signal.aborted)setLoading(false);});
+    return ()=>controller.abort();
+  },[run,query,page,retry]);
+  useEffect(()=>{
+    const controller=new AbortController();setRegistryLoading(true);setRegistryError('');setRegistered(null);
+    run<Page<Registered>>('/api/github/repositories?'+new URLSearchParams({offset:String(offset),limit:String(LIMIT)}),{signal:controller.signal})
+      .then(data=>{if(!controller.signal.aborted)setRegistered(data);})
+      .catch(e=>{if(!controller.signal.aborted)setRegistryError(errorMessage(e));})
+      .finally(()=>{if(!controller.signal.aborted)setRegistryLoading(false);});
+    return ()=>controller.abort();
+  },[run,offset,refresh]);
+  async function sync(repo:Repository){
+    if(!write||busy)return;
+    setBusy(true);setSyncError('');setNotice('');
+    try {const saved=await run<Registered>('/api/github/sync',json('POST',{owner:repo.owner,repo:repo.name}));setNotice(saved.owner+'/'+saved.name+' synchronized.');setRefresh(n=>n+1);}
+    catch(e){setSyncError(errorMessage(e));}finally{setBusy(false);}
+  }
+  function row(repo:Repository){return <><strong>{repo.owner}/{repo.name}</strong>{repo.archived&&<span> · Archived</span>}<p>{repo.description||'No description provided.'}</p><small>Default branch: {repo.default_branch}</small></>;}
+  return <>
+    <div className="heading"><h1 ref={heading} tabIndex={-1}>GitHub repositories</h1><p>Discover public repositories and explicitly synchronize metadata into Panggung. No remote writes or automatic catalog imports.</p></div>
+    {notice&&<p role="status" className="notice">{notice}</p>}{syncError&&<p role="alert" className="error">{syncError}</p>}
+    <section className="panel section">
+      <h2>Discover public repositories</h2>
+      <form className="filters" onSubmit={e=>{e.preventDefault();setQuery(owner.trim());setPage(1);setRetry(n=>n+1);}}>
+        <label>GitHub owner<input required maxLength={39} value={owner} onChange={e=>setOwner(e.target.value)} placeholder="Organization or username"/></label>
+        <button className="primary" disabled={!owner.trim()}>Discover</button>
+      </form>
+      {loading?<p role="status">Discovering repositories…</p>:error?<><p role="alert" className="error">{error}</p><button onClick={()=>setRetry(n=>n+1)}>Retry discovery</button></>:discovered?<>{discovered.items.length===0?<p>No public repositories on this page.</p>:<ul className="relations">{discovered.items.map(repo=><li key={repo.github_id}><div>{row(repo)}</div>{write&&<button disabled={busy} onClick={()=>sync(repo)}>Sync repository</button>}</li>)}</ul>}</>:<p>Enter an owner to discover repositories.</p>}
+      {query&&<div className="pagination"><span>Page {page}</span><div className="actions"><button disabled={loading||page===1} onClick={()=>setPage(n=>n-1)}>Previous</button><button disabled={loading||!discovered?.has_more} onClick={()=>setPage(n=>n+1)}>Next</button></div></div>}
+    </section>
+    <section className="panel section"><h2>Synced repository registry</h2>
+      <p className="muted">Descriptor discovery checks only the conventional root catalog-info.yaml file; found means a candidate exists, not that its contents are valid.</p>
+      {registryLoading?<p role="status">Loading registry…</p>:registryError?<><p role="alert" className="error">{registryError}</p><button onClick={()=>setRefresh(n=>n+1)}>Retry registry</button></>:registered?.items.length?<ul className="relations">{registered.items.map(repo=><li key={repo.github_id}><div>{row(repo)}<p>Descriptor: {repo.descriptor_status} · Last sync: {new Date(repo.synced_at*1000).toLocaleString()}</p></div>{write&&<button disabled={busy} onClick={()=>sync(repo)}>Sync again</button>}</li>)}</ul>:<p>No repositories synchronized on this page.</p>}
+      <div className="pagination"><span>Page {Math.floor(offset/LIMIT)+1}</span><div className="actions"><button disabled={registryLoading||offset===0} onClick={()=>setOffset(n=>Math.max(0,n-LIMIT))}>Previous</button><button disabled={registryLoading||!registered?.has_more} onClick={()=>setOffset(n=>n+LIMIT)}>Next</button></div></div>
+    </section>
+  </>;
+}

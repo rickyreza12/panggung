@@ -5,8 +5,10 @@ mod catalog_repository;
 mod catalog_structure;
 mod config;
 mod database;
+mod github;
 pub mod identity;
 mod interfaces;
+mod observability;
 mod organization;
 mod scaffolder;
 mod scorecards;
@@ -68,6 +70,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let docs_storage = storage::LocalStorage::open(config.data_dir.join("techdocs"))?;
     storage::validate_capabilities(&docs_storage)?;
     let docs_storage: Arc<dyn storage::ObjectStore> = Arc::new(docs_storage);
+    let metrics = Arc::new(observability::Metrics::default());
     let organization_routes = organization::routes(pool.clone())
         .merge(catalog_structure::routes(pool.clone()))
         .merge(templates::routes(pool.clone()))
@@ -75,6 +78,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .merge(techdocs::routes(pool.clone(), docs_storage.clone()))
         .merge(search::routes(pool.clone()))
         .merge(interfaces::routes(pool.clone()))
+        .merge(github::routes(pool.clone())?)
+        .merge(observability::routes(metrics.clone()))
         .merge(scorecards::routes(pool.clone(), docs_storage));
     let repository: CatalogState = Arc::new(SqliteCatalogRepository::new(pool));
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, config.port)).await?;
@@ -82,7 +87,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Panggung listening on http://{}", listener.local_addr()?);
     axum::serve(
         listener,
-        production_router(repository, storage.routes(), organization_routes, auth),
+        observability::instrument(
+            production_router(repository, storage.routes(), organization_routes, auth),
+            metrics,
+        ),
     )
     .with_graceful_shutdown(async {
         let _ = tokio::signal::ctrl_c().await;
