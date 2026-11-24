@@ -10,6 +10,7 @@ pub mod identity;
 mod interfaces;
 mod observability;
 mod organization;
+mod publish;
 mod scaffolder;
 mod scorecards;
 mod search;
@@ -81,6 +82,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .merge(search::routes(pool.clone()))
         .merge(interfaces::routes(pool.clone()))
         .merge(github::routes(pool.clone())?)
+        .merge(publish::routes(pool.clone())?)
         .merge(observability::routes(metrics.clone()))
         .merge(webhook_management)
         .merge(scorecards::routes(pool.clone(), docs_storage));
