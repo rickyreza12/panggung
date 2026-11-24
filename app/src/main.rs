@@ -6,6 +6,7 @@ mod catalog_structure;
 mod config;
 mod database;
 pub mod identity;
+mod interfaces;
 mod organization;
 mod scaffolder;
 mod scorecards;
@@ -73,6 +74,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .merge(scaffolder::routes(pool.clone()))
         .merge(techdocs::routes(pool.clone(), docs_storage.clone()))
         .merge(search::routes(pool.clone()))
+        .merge(interfaces::routes(pool.clone()))
         .merge(scorecards::routes(pool.clone(), docs_storage));
     let repository: CatalogState = Arc::new(SqliteCatalogRepository::new(pool));
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, config.port)).await?;
