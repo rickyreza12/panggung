@@ -8,6 +8,8 @@ mod database;
 pub mod identity;
 mod organization;
 mod scaffolder;
+mod scorecards;
+mod search;
 mod storage;
 mod techdocs;
 mod templates;
@@ -64,11 +66,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     storage::validate_capabilities(&storage)?;
     let docs_storage = storage::LocalStorage::open(config.data_dir.join("techdocs"))?;
     storage::validate_capabilities(&docs_storage)?;
+    let docs_storage: Arc<dyn storage::ObjectStore> = Arc::new(docs_storage);
     let organization_routes = organization::routes(pool.clone())
         .merge(catalog_structure::routes(pool.clone()))
         .merge(templates::routes(pool.clone()))
         .merge(scaffolder::routes(pool.clone()))
-        .merge(techdocs::routes(pool.clone(), Arc::new(docs_storage)));
+        .merge(techdocs::routes(pool.clone(), docs_storage.clone()))
+        .merge(search::routes(pool.clone()))
+        .merge(scorecards::routes(pool.clone(), docs_storage));
     let repository: CatalogState = Arc::new(SqliteCatalogRepository::new(pool));
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, config.port)).await?;
     let auth = auth::AuthState::new(identity, listener.local_addr()?.port());
