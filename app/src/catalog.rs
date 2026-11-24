@@ -19,10 +19,10 @@ pub struct NewComponent {
 type ApiError = (StatusCode, &'static str);
 
 fn internal(error: sqlx::Error) -> ApiError {
-    if let sqlx::Error::Database(ref db) = error {
-        if db.is_unique_violation() {
-            return (StatusCode::CONFLICT, "Component already exists");
-        }
+    if let sqlx::Error::Database(ref db) = error
+        && db.is_unique_violation()
+    {
+        return (StatusCode::CONFLICT, "Component already exists");
     }
     tracing::error!("Catalog database operation failed");
     (
