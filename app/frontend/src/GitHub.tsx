@@ -6,7 +6,7 @@ interface Repository {github_id:number;owner:string;name:string;description:stri
 interface Registered extends Repository {descriptor_status:'found'|'missing'|'unsupported';synced_at:number;synced_by:number|null}
 interface Page<T> {items:T[];has_more:boolean}
 const LIMIT=20;
-export default function GitHub({run,write}:{run:typeof request;write:boolean}) {
+export default function GitHub({run,write,admin}:{run:typeof request;write:boolean;admin:boolean}) {
   const heading=useRef<HTMLHeadingElement>(null);
   const [owner,setOwner]=useState('');
   const [query,setQuery]=useState('');
@@ -66,5 +66,25 @@ export default function GitHub({run,write}:{run:typeof request;write:boolean}) {
       {registryLoading?<p role="status">Loading registry…</p>:registryError?<><p role="alert" className="error">{registryError}</p><button onClick={()=>setRefresh(n=>n+1)}>Retry registry</button></>:registered?.items.length?<ul className="relations">{registered.items.map(repo=><li key={repo.github_id}><div>{row(repo)}<p>Descriptor: {repo.descriptor_status} · Last sync: {new Date(repo.synced_at*1000).toLocaleString()}</p></div>{write&&<button disabled={busy} onClick={()=>sync(repo)}>Sync again</button>}</li>)}</ul>:<p>No repositories synchronized on this page.</p>}
       <div className="pagination"><span>Page {Math.floor(offset/LIMIT)+1}</span><div className="actions"><button disabled={registryLoading||offset===0} onClick={()=>setOffset(n=>Math.max(0,n-LIMIT))}>Previous</button><button disabled={registryLoading||!registered?.has_more} onClick={()=>setOffset(n=>n+LIMIT)}>Next</button></div></div>
     </section>
+    {admin&&<WebhookSettings run={run}/>}
   </>;
+}
+
+interface WebhookStatus {enabled:boolean;secret_configured:boolean;accepted_deliveries:number;last_received_at:number|null}
+function WebhookSettings({run}:{run:typeof request}){
+  const [status,setStatus]=useState<WebhookStatus|null>(null);
+  const [error,setError]=useState('');
+  const [busy,setBusy]=useState(false);
+  const [refresh,setRefresh]=useState(0);
+  useEffect(()=>{
+    const controller=new AbortController();
+    run<WebhookStatus>('/api/webhooks/github/status',{signal:controller.signal}).then(value=>{if(!controller.signal.aborted){setStatus(value);setError('');}}).catch(e=>{if(!controller.signal.aborted)setError(errorMessage(e));});
+    return ()=>controller.abort();
+  },[run,refresh]);
+  async function configure(enabled:boolean){
+    setBusy(true);setError('');
+    try{await run('/api/webhooks/github/config',json('PUT',{enabled}));setStatus(null);setRefresh(n=>n+1);}
+    catch(e){setError(errorMessage(e));}finally{setBusy(false);}
+  }
+  return <section className="panel section"><h2>GitHub webhook administration</h2><p>Receive signed delivery receipts at /api/webhooks/github. Automatic synchronization is not enabled. Configure the signing secret on the server, never in the browser.</p>{error&&<p role="alert" className="error">{error}</p>}{status?<><p role="status">Ingestion: {status.enabled?'Enabled':'Disabled'} · Signing secret: {status.secret_configured?'Configured':'Not configured'}</p><p>Unique accepted deliveries: {status.accepted_deliveries}</p><p>Last receipt: {status.last_received_at===null?'None':new Date(status.last_received_at*1000).toLocaleString()}</p><button disabled={busy||(!status.enabled&&!status.secret_configured)} onClick={()=>configure(!status.enabled)}>{status.enabled?'Disable ingestion':'Enable ingestion'}</button></>:!error?<p role="status">Loading webhook configuration…</p>:null}<button disabled={busy} onClick={()=>setRefresh(n=>n+1)}>Refresh webhook status</button></section>;
 }

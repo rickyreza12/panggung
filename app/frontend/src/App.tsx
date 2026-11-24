@@ -191,7 +191,7 @@ export default function App(){
       view.kind==='search'?<Search run={run} admin={canManageUsers(user)} onSelect={(namespace,name)=>navigate({kind:'detail',namespace,name})}/>:
       view.kind==='scorecards'?<Scorecards run={run} admin={canManageUsers(user)} write={write}/>:
       view.kind==='interfaces'?<Interfaces run={run} write={write} onSelect={(namespace,name)=>navigate({kind:'detail',namespace,name})}/>:
-      view.kind==='github'?<GitHub run={run} write={write}/>:
+      view.kind==='github'?<GitHub run={run} write={write} admin={canManageUsers(user)}/>:
       view.kind==='create'&&write?<><Heading title="Register component"><p>Register a component in the default namespace.</p></Heading><ComponentForm run={run} onSaved={onSaved} cancel={()=>navigate({kind:'catalog'})}/></>:
       view.kind==='import'&&write?<ImportForm run={run} onSaved={onSaved} cancel={()=>navigate({kind:'catalog'})}/>:
       view.kind==='detail'||view.kind==='edit'?<Detail key={view.kind+'/'+view.namespace+'/'+view.name} namespace={view.namespace} name={view.name} editing={view.kind==='edit'} write={write} run={run} navigate={navigate} onSaved={onSaved} onDeleted={()=>{setView({kind:'catalog'});setNotice('Component deleted.');}}/>:<p role="alert">You do not have permission to access this page.</p>}
