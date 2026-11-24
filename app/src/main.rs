@@ -16,6 +16,7 @@ mod search;
 mod storage;
 mod techdocs;
 mod templates;
+mod webhook;
 
 use axum::{
     Router,
@@ -71,6 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     storage::validate_capabilities(&docs_storage)?;
     let docs_storage: Arc<dyn storage::ObjectStore> = Arc::new(docs_storage);
     let metrics = Arc::new(observability::Metrics::default());
+    let (webhook_management, webhook_receiver) = webhook::routes(pool.clone())?;
     let organization_routes = organization::routes(pool.clone())
         .merge(catalog_structure::routes(pool.clone()))
         .merge(templates::routes(pool.clone()))
@@ -80,6 +82,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .merge(interfaces::routes(pool.clone()))
         .merge(github::routes(pool.clone())?)
         .merge(observability::routes(metrics.clone()))
+        .merge(webhook_management)
         .merge(scorecards::routes(pool.clone(), docs_storage));
     let repository: CatalogState = Arc::new(SqliteCatalogRepository::new(pool));
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, config.port)).await?;
@@ -88,7 +91,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     axum::serve(
         listener,
         observability::instrument(
-            production_router(repository, storage.routes(), organization_routes, auth),
+            production_router(repository, storage.routes(), organization_routes, auth)
+                .merge(webhook_receiver),
             metrics,
         ),
     )
