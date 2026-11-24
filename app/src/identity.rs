@@ -8,7 +8,7 @@ use sqlx::SqlitePool;
 
 pub const SESSION_LIFETIME_SECONDS: i64 = 24 * 60 * 60;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type, serde::Serialize, serde::Deserialize)]
 #[sqlx(type_name = "TEXT", rename_all = "lowercase")]
 #[serde(rename_all = "lowercase")]
 pub enum Role {

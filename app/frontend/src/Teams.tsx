@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import type { FormEvent } from 'react';
 import { errorMessage, json, request } from './api';
 import type { User } from './api';
+import CreateUser from './CreateUser';
 
 interface Team { id: string | number; name: string; members: User[] }
 
@@ -43,6 +44,7 @@ export default function Teams({ run, admin }: { run: typeof request; admin: bool
   return <>
     <div className="heading"><h1 tabIndex={-1} ref={node=>{node?.focus();}}>Teams</h1><p>Browse engineering teams and their registered members.</p></div>
     {error&&<p className="error" role="alert">{error}</p>}{notice&&<p className="notice" role="status">{notice}</p>}
+    {admin&&<CreateUser run={run} onCreated={user=>{setUsers(old=>[...old.filter(existing=>existing.id!==user.id),user]);setNotice('User created.');setRefresh(n=>n+1);}}/>}
     {admin&&<form className="panel filters" onSubmit={create}><label>New team name<input required maxLength={100} value={name} onChange={e=>setName(e.target.value)}/></label><button className="primary" disabled={busy||!name.trim()}>Create team</button></form>}
     {loading?<p role="status">Loading teams…</p>:error&&teams.length===0?<button onClick={()=>setRefresh(n=>n+1)}>Try again</button>:teams.length===0?<div className="panel empty"><h2>No teams registered</h2><p>{admin?'Create a team to get started.':'Ask an administrator to create a team.'}</p></div>:teams.map(team=><section className="panel section" key={team.id}><h2>{team.name}</h2>
       {team.members.length===0?<p>No members assigned.</p>:<ul className="relations">{team.members.map(member=><li key={member.id}><strong>{member.username}</strong><span>{member.role}</span>{admin&&<button className="danger" disabled={busy} aria-label={'Remove '+member.username+' from '+team.name} onClick={()=>{if(window.confirm('Remove '+member.username+' from '+team.name+'?'))void membership(team,String(member.id),'DELETE');}}>Remove</button>}</li>)}</ul>}

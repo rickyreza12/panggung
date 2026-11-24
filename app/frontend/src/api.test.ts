@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, afterEach } from 'vitest';
-import { ApiError, canWrite, componentPath, importBody, listPath, request } from './api';
+import { ApiError, canManageUsers, canWrite, componentPath, createUserError, createUserRequest, importBody, listPath, request } from './api';
 afterEach(()=>vi.unstubAllGlobals());
 describe('catalog API',()=>{
   it('encodes qualified identity and search without losing namespace',()=>{
@@ -18,6 +18,23 @@ describe('catalog API',()=>{
     vi.stubGlobal('fetch',fetch);
     await expect(request('/api/components',{method:'DELETE'})).rejects.toMatchObject({status:403});
     expect(fetch).toHaveBeenCalledWith('/api/components',{method:'DELETE',credentials:'same-origin'});
+  });
+  it('allows only administrators to manage users',()=>{
+    for (const role of ['member','viewer','unknown']) expect(canManageUsers({id:1,username:'a',role})).toBe(false);
+    expect(canManageUsers({id:1,username:'a',role:'admin'})).toBe(true);
+  });
+  it('submits only the supported fields and validates roles and password byte length',()=>{
+    const password='test-only-password';
+    for (const role of ['viewer','member','admin']) expect(JSON.parse(String(createUserRequest('new.user',password,role).body))).toEqual({username:'new.user',password,role});
+    expect(()=>createUserRequest('new.user',password,'editor')).toThrow('valid role');
+    expect(()=>createUserRequest('Bad',password,'viewer')).toThrow('lowercase');
+    expect(()=>createUserRequest('valid','short','viewer')).toThrow('12–1024');
+    expect(()=>createUserRequest('valid','é'.repeat(513),'viewer')).toThrow('12–1024');
+  });
+  it('does not display credential-bearing server or network errors',()=>{
+    expect(createUserError(new ApiError(409,'secret-password'))).toBe('That username is already registered.');
+    expect(createUserError(new ApiError(403,'secret-password'))).toBe('Administrator access is required.');
+    expect(createUserError(new Error('secret-password'))).not.toContain('secret-password');
   });
   it('handles logout without parsing an empty body',async()=>{
     vi.stubGlobal('fetch',vi.fn().mockResolvedValue(new Response(null,{status:204})));

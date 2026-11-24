@@ -15,3 +15,4 @@
 - Authenticated team and membership management with audit events.
 - Embedded React, TypeScript and Vite developer portal with functional catalog and team views.
 - Frontend build, lint, type checking and tests in continuous integration.
+- Administrator-only local account creation with validated roles, atomic audit records and a developer portal form.

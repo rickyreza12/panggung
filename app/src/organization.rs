@@ -1,7 +1,7 @@
-use crate::identity::{Role, User};
+use crate::identity::{IdentityError, IdentityStore, Role, User};
 use axum::{
     Extension, Json, Router,
-    extract::{DefaultBodyLimit, Path, State},
+    extract::{DefaultBodyLimit, Path, State, rejection::JsonRejection},
     http::StatusCode,
     routing::{get, put},
 };
@@ -22,6 +22,14 @@ struct NewTeam {
     name: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NewUser {
+    username: String,
+    password: String,
+    role: Role,
+}
+
 #[derive(sqlx::FromRow)]
 struct TeamRow {
     team_id: i64,
@@ -33,7 +41,12 @@ struct TeamRow {
 
 pub fn routes(pool: SqlitePool) -> Router {
     Router::new()
-        .route("/api/organization/users", get(list_users))
+        .route(
+            "/api/organization/users",
+            get(list_users)
+                .post(create_user)
+                .layer(DefaultBodyLimit::max(8192)),
+        )
         .route(
             "/api/organization/teams",
             get(list).post(create).layer(DefaultBodyLimit::max(4096)),
@@ -76,6 +89,37 @@ async fn list_users(
     .await
     .map(Json)
     .map_err(database_error)
+}
+
+async fn create_user(
+    State(pool): State<SqlitePool>,
+    Extension(actor): Extension<User>,
+    input: Result<Json<NewUser>, JsonRejection>,
+) -> Result<(StatusCode, Json<User>), ApiError> {
+    require_admin(&actor)?;
+    let Json(input) = input.map_err(|error| {
+        let status = error.status();
+        if status == StatusCode::PAYLOAD_TOO_LARGE {
+            (status, "Request too large")
+        } else {
+            (StatusCode::BAD_REQUEST, "Invalid user request")
+        }
+    })?;
+    let user = IdentityStore::new(pool)
+        .create_user(actor.id, &input.username, &input.password, input.role)
+        .await
+        .map_err(|error| match error {
+            IdentityError::InvalidInput => {
+                (StatusCode::BAD_REQUEST, "Invalid username or password")
+            }
+            IdentityError::Forbidden => (StatusCode::FORBIDDEN, "Administrator required"),
+            IdentityError::Conflict => (StatusCode::CONFLICT, "Username already exists"),
+            _ => {
+                tracing::error!("User creation failed");
+                (StatusCode::INTERNAL_SERVER_ERROR, "User creation failed")
+            }
+        })?;
+    Ok((StatusCode::CREATED, Json(user)))
 }
 
 async fn list(
@@ -279,6 +323,99 @@ mod tests {
             status,
             serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
         )
+    }
+
+    #[tokio::test]
+    async fn create_user_requires_admin_and_audits_only_successful_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = crate::database::open(&dir.path().join("users.db"))
+            .await
+            .unwrap();
+        let identity = IdentityStore::new(pool.clone());
+        let mut random = [0u8; 32];
+        OsRng.fill_bytes(&mut random);
+        let password: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
+        let admin = identity.bootstrap_admin("admin", &password).await.unwrap();
+        identity
+            .create_user(admin.id, "member", &password, Role::Member)
+            .await
+            .unwrap();
+        identity
+            .create_user(admin.id, "viewer", &password, Role::Viewer)
+            .await
+            .unwrap();
+        let admin_token = identity.login("admin", &password).await.unwrap();
+        let member_token = identity.login("member", &password).await.unwrap();
+        let viewer_token = identity.login("viewer", &password).await.unwrap();
+        let app = auth::protect(routes(pool.clone()), AuthState::new(identity.clone(), 3000));
+        let path = "/api/organization/users";
+        let valid = serde_json::json!({"username":"new-user","password":password,"role":"viewer"})
+            .to_string();
+        for (token, expected) in [
+            ("", StatusCode::UNAUTHORIZED),
+            (member_token.as_str(), StatusCode::FORBIDDEN),
+            (viewer_token.as_str(), StatusCode::FORBIDDEN),
+        ] {
+            assert_eq!(call(&app, "POST", path, token, &valid).await.0, expected);
+        }
+        let token = admin_token.as_str();
+        for invalid in [
+            serde_json::json!({"username":"../bad","password":password,"role":"member"}),
+            serde_json::json!({"username":"new-user","password":"short","role":"member"}),
+            serde_json::json!({"username":"new-user","password":password,"role":"owner"}),
+        ] {
+            assert_eq!(
+                call(&app, "POST", path, token, &invalid.to_string())
+                    .await
+                    .0,
+                StatusCode::BAD_REQUEST
+            );
+        }
+        let (status, user) = call(&app, "POST", path, token, &valid).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let user_id = user["id"].as_i64().unwrap();
+        assert_eq!(
+            user,
+            serde_json::json!({"id":user_id,"username":"new-user","role":"viewer"})
+        );
+        assert_eq!(
+            call(&app, "POST", path, token, &valid).await.0,
+            StatusCode::CONFLICT
+        );
+        let new_token = identity.login("new-user", &password).await.unwrap();
+        assert_eq!(
+            identity
+                .resolve_session(new_token.as_str())
+                .await
+                .unwrap()
+                .role,
+            Role::Viewer
+        );
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM identity_users")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 4);
+        let events: Vec<(i64,i64)> = sqlx::query_as("SELECT actor_id, subject_id FROM identity_audit_events WHERE action = 'create_user' ORDER BY id").fetch_all(&pool).await.unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[2], (admin.id, user_id));
+        // Force audit failure and ensure the user insert rolls back with it.
+        sqlx::query("CREATE TRIGGER reject_user_audit BEFORE INSERT ON identity_audit_events WHEN NEW.action = 'create_user' BEGIN SELECT RAISE(ABORT, 'audit unavailable'); END")
+            .execute(&pool).await.unwrap();
+        let rejected =
+            serde_json::json!({"username":"rollback-user","password":password,"role":"member"})
+                .to_string();
+        assert_eq!(
+            call(&app, "POST", path, token, &rejected).await.0,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM identity_users WHERE username = 'rollback-user'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 0);
     }
 
     #[tokio::test]

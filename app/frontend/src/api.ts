@@ -31,6 +31,24 @@ export function listPath(filters: Filters, offset: number, limit: number) {
   return '/api/components?' + query.toString();
 }
 export function canWrite(user: User) { return ['admin', 'member'].includes(user.role.toLowerCase()); }
+export function canManageUsers(user: User) { return user.role.toLowerCase() === 'admin'; }
+export const userRoles = ['viewer', 'member', 'admin'] as const;
+export function createUserRequest(username: string, password: string, role: string): RequestInit {
+  if (!/^[a-z0-9][a-z0-9_.-]{0,62}$/.test(username)) throw new Error('Use 1–63 lowercase letters, digits, dots, underscores or hyphens; start with a letter or digit.');
+  const bytes = new TextEncoder().encode(password).length;
+  if (bytes < 12 || bytes > 1024) throw new Error('Password must contain 12–1024 UTF-8 bytes.');
+  if (!userRoles.some(value => value === role)) throw new Error('Select a valid role.');
+  return json('POST', { username, password, role });
+}
+// Never display arbitrary server error bodies for credential submissions.
+export function createUserError(error: unknown) {
+  if (error instanceof ApiError) {
+    if (error.status === 409) return 'That username is already registered.';
+    if (error.status === 400 || error.status === 422) return 'The server rejected the account details. Check the username, password and role.';
+    if (error.status === 401 || error.status === 403) return 'Administrator access is required.';
+  }
+  return 'Could not create the user. Try again.';
+}
 export function errorMessage(error: unknown) { return error instanceof Error ? error.message : 'Request failed. Try again.'; }
 export function importBody(format: 'json' | 'yaml', value: string) {
   if (new TextEncoder().encode(value).length > 65536) throw new Error('Descriptor exceeds the 64 KiB size limit.');

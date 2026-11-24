@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { FormEvent, ReactNode } from 'react';
-import { ApiError, canWrite, componentPath, errorMessage, importBody, json, listPath, request } from './api';
+import { ApiError, canManageUsers, canWrite, componentPath, errorMessage, importBody, json, listPath, request } from './api';
 import type { Component, Fields, Filters, Relation, User } from './api';
 import Teams from './Teams';
 
@@ -175,7 +175,7 @@ export default function App(){
   return <><a className="skip" href="#main">Skip to content</a><header className="topbar"><div className="brand">Panggung<span>Developer portal</span></div><nav aria-label="Main navigation"><button className="nav-link" aria-current={view.kind!=='teams'?'page':undefined} onClick={()=>navigate({kind:'catalog'})}>Catalog</button><button className="nav-link" aria-current={view.kind==='teams'?'page':undefined} onClick={()=>navigate({kind:'teams'})}>Teams</button></nav><div className="account"><div><strong>{user.username}</strong><small>{user.role}</small></div><button disabled={logoutBusy} onClick={logout}>{logoutBusy?'Signing out…':'Sign out'}</button></div></header>
     <main id="main" className="workspace"><ErrorNotice message={sessionError}/>{notice&&<p className="notice" role="status">{notice}</p>}
       {view.kind==='catalog'?<Catalog write={write} navigate={navigate} run={run} filters={filters} setFilters={setFilters} offset={offset} setOffset={setOffset}/>:
-      view.kind==='teams'?<Teams run={run} admin={user.role.toLowerCase()==='admin'}/>:
+      view.kind==='teams'?<Teams run={run} admin={canManageUsers(user)}/>:
       view.kind==='create'&&write?<><Heading title="Register component"><p>Register a component in the default namespace.</p></Heading><ComponentForm run={run} onSaved={onSaved} cancel={()=>navigate({kind:'catalog'})}/></>:
       view.kind==='import'&&write?<ImportForm run={run} onSaved={onSaved} cancel={()=>navigate({kind:'catalog'})}/>:
       view.kind==='detail'||view.kind==='edit'?<Detail key={view.kind+'/'+view.namespace+'/'+view.name} namespace={view.namespace} name={view.name} editing={view.kind==='edit'} write={write} run={run} navigate={navigate} onSaved={onSaved} onDeleted={()=>{setView({kind:'catalog'});setNotice('Component deleted.');}}/>:<p role="alert">You do not have permission to access this page.</p>}
