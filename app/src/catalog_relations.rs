@@ -9,6 +9,19 @@ pub struct Relation {
     pub target_ref: String,
 }
 
+#[derive(Debug, Serialize)]
+pub struct ResolvedRelation {
+    #[serde(flatten)]
+    pub relation: Relation,
+    pub resolved: bool,
+}
+
+pub fn reference_parts(reference: &str) -> Option<(&str, &str, &str)> {
+    let (kind, rest) = reference.split_once(':')?;
+    let (namespace, name) = rest.split_once('/')?;
+    Some((kind, namespace, name))
+}
+
 #[derive(Debug)]
 pub struct InvalidReference;
 

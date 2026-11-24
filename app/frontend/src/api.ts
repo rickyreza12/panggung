@@ -1,6 +1,18 @@
 export interface User { id: string | number; username: string; role: string }
 export interface Component { name: string; namespace: string; owner: string; description: string; component_type: string | null; lifecycle: string | null; descriptor: unknown }
-export interface Relation { type: string; targetRef: string }
+export interface Relation { type: string; targetRef: string; resolved?: boolean }
+export interface Domain { namespace: string; name: string }
+export interface System extends Domain { domain_namespace: string | null; domain_name: string | null }
+export function entityKey(entity: Domain) { return entity.namespace + '/' + entity.name; }
+export function relationStatus(relation: Relation) {
+  return relation.resolved === true ? 'Resolved' : relation.resolved === false ? 'Unresolved' : 'Not checked';
+}
+export function structureRequest(kind: 'domains' | 'systems', namespace: string, name: string, domain?: Domain) {
+  const valid = (value: string) => /^[a-z0-9](?:[a-z0-9_.-]{0,61}[a-z0-9])?$/.test(value);
+  if (!valid(namespace) || !valid(name) || (domain && (!valid(domain.namespace) || !valid(domain.name)))) throw new Error('Invalid namespace or name. Use 1–63 lowercase characters and start and end with a letter or digit.');
+  const body = kind === 'domains' ? {namespace,name} : {namespace,name,domain_namespace:domain?.namespace ?? null,domain_name:domain?.name ?? null};
+  return {path:'/api/catalog/'+kind, init:json('POST',body)};
+}
 export interface Fields { name: string; owner: string; description: string }
 export interface Filters { q: string; namespace: string }
 export class ApiError extends Error {

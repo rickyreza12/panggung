@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { FormEvent, ReactNode } from 'react';
-import { ApiError, canManageUsers, canWrite, componentPath, errorMessage, importBody, json, listPath, request } from './api';
+import { ApiError, canManageUsers, canWrite, componentPath, errorMessage, importBody, json, listPath, relationStatus, request } from './api';
 import type { Component, Fields, Filters, Relation, User } from './api';
 import Teams from './Teams';
+import Structure from './Structure';
+import Templates from './Templates';
 
-type View = { kind: 'catalog' | 'teams' } | { kind: 'detail' | 'edit'; namespace: string; name: string } | { kind: 'create' | 'import' };
+type View = { kind: 'catalog' | 'teams' | 'structure' | 'templates' } | { kind: 'detail' | 'edit'; namespace: string; name: string } | { kind: 'create' | 'import' };
 const PAGE_SIZE = 20;
 const initialFilters: Filters = { q: '', namespace: '' };
 
@@ -140,7 +142,7 @@ function Detail({namespace,name,editing,write,run,navigate,onSaved,onDeleted}:{n
     <div className="page-top"><Heading title={item.name}><p><code>{item.namespace}/{item.name}</code></p></Heading>{write&&<div className="actions"><button onClick={()=>navigate({kind:'edit',namespace,name})}>Edit component</button><button ref={deleteButton} className="danger" onClick={()=>{setDeleting(true);dialog.current?.showModal();}}>Delete</button></div>}</div>
     <ErrorNotice message={error}/>
     <section className="panel section"><h2>Overview</h2><p>{item.description||'No description provided.'}</p><dl className="facts"><div><dt>Owner</dt><dd>{item.owner}</dd></div><div><dt>Type</dt><dd>{item.component_type??'Not specified'}</dd></div><div><dt>Lifecycle</dt><dd>{item.lifecycle??'Not specified'}</dd></div></dl></section>
-    <section className="panel section"><h2>Declared relationships</h2><p className="muted">References are declarations; target existence has not been verified.</p>{relationError?<ErrorNotice message={relationError}/>:relations===null?<p role="status">Loading relationships…</p>:relations.length===0?<p>No relationships declared.</p>:<ul className="relations">{relations.map((r,i)=><li key={r.type+r.targetRef+i}><span>{r.type}</span><code>{r.targetRef}</code></li>)}</ul>}</section>
+    <section className="panel section"><h2>Declared relationships</h2><p className="muted">Resolution checks whether the referenced target exists in the registered catalog or organization. Unsupported or missing targets remain unresolved.</p>{relationError?<><ErrorNotice message={relationError}/><button onClick={()=>setRetry(n=>n+1)}>Retry relationships</button></>:relations===null?<p role="status">Loading relationships…</p>:relations.length===0?<p>No relationships declared.</p>:<ul className="relations">{relations.map((r,i)=><li key={r.type+r.targetRef+i}><span>{r.type}</span><code>{r.targetRef}</code><span className={'relation-status '+(r.resolved===true?'resolved':r.resolved===false?'unresolved':'unchecked')}>{relationStatus(r)}</span></li>)}</ul>}</section>
     <section className="panel section"><h2>Stored descriptor</h2>{item.descriptor?<pre>{JSON.stringify(item.descriptor,null,2)}</pre>:<p>Registered manually. No descriptor stored.</p>}</section>
     <dialog ref={dialog} aria-labelledby="delete-title" onClose={()=>{setDeleting(false);deleteButton.current?.focus();}} onCancel={e=>{if(busy)e.preventDefault();}}>
       <h2 id="delete-title">Delete component?</h2><p>Remove <strong>{namespace}/{name}</strong> from the catalog. This cannot be undone.</p><div className="actions"><button autoFocus disabled={busy} onClick={()=>dialog.current?.close()}>Cancel</button><button className="danger" disabled={busy||!deleting} onClick={remove}>{busy?'Deleting…':'Delete component'}</button></div>
@@ -172,10 +174,12 @@ export default function App(){
   if(!user&&sessionError)return <main className="login"><div className="login-panel"><Heading title="Session unavailable"/><ErrorNotice message={sessionError}/><button onClick={()=>setSessionRetry(n=>n+1)}>Try again</button></div></main>;
   if(!user)return <Login onLogin={value=>{setSessionError('');setUser(value);setView({kind:'catalog'});}}/>;
   const write=canWrite(user);
-  return <><a className="skip" href="#main">Skip to content</a><header className="topbar"><div className="brand">Panggung<span>Developer portal</span></div><nav aria-label="Main navigation"><button className="nav-link" aria-current={view.kind!=='teams'?'page':undefined} onClick={()=>navigate({kind:'catalog'})}>Catalog</button><button className="nav-link" aria-current={view.kind==='teams'?'page':undefined} onClick={()=>navigate({kind:'teams'})}>Teams</button></nav><div className="account"><div><strong>{user.username}</strong><small>{user.role}</small></div><button disabled={logoutBusy} onClick={logout}>{logoutBusy?'Signing out…':'Sign out'}</button></div></header>
+  return <><a className="skip" href="#main">Skip to content</a><header className="topbar"><div className="brand">Panggung<span>Developer portal</span></div><nav aria-label="Main navigation"><button className="nav-link" aria-current={view.kind!=='teams'&&view.kind!=='structure'&&view.kind!=='templates'?'page':undefined} onClick={()=>navigate({kind:'catalog'})}>Catalog</button><button className="nav-link" aria-current={view.kind==='structure'?'page':undefined} onClick={()=>navigate({kind:'structure'})}>Structure</button><button className="nav-link" aria-current={view.kind==='templates'?'page':undefined} onClick={()=>navigate({kind:'templates'})}>Templates</button><button className="nav-link" aria-current={view.kind==='teams'?'page':undefined} onClick={()=>navigate({kind:'teams'})}>Teams</button></nav><div className="account"><div><strong>{user.username}</strong><small>{user.role}</small></div><button disabled={logoutBusy} onClick={logout}>{logoutBusy?'Signing out…':'Sign out'}</button></div></header>
     <main id="main" className="workspace"><ErrorNotice message={sessionError}/>{notice&&<p className="notice" role="status">{notice}</p>}
       {view.kind==='catalog'?<Catalog write={write} navigate={navigate} run={run} filters={filters} setFilters={setFilters} offset={offset} setOffset={setOffset}/>:
       view.kind==='teams'?<Teams run={run} admin={canManageUsers(user)}/>:
+      view.kind==='structure'?<Structure run={run} write={write}/>:
+      view.kind==='templates'?<Templates run={run} admin={canManageUsers(user)}/>:
       view.kind==='create'&&write?<><Heading title="Register component"><p>Register a component in the default namespace.</p></Heading><ComponentForm run={run} onSaved={onSaved} cancel={()=>navigate({kind:'catalog'})}/></>:
       view.kind==='import'&&write?<ImportForm run={run} onSaved={onSaved} cancel={()=>navigate({kind:'catalog'})}/>:
       view.kind==='detail'||view.kind==='edit'?<Detail key={view.kind+'/'+view.namespace+'/'+view.name} namespace={view.namespace} name={view.name} editing={view.kind==='edit'} write={write} run={run} navigate={navigate} onSaved={onSaved} onDeleted={()=>{setView({kind:'catalog'});setNotice('Component deleted.');}}/>:<p role="alert">You do not have permission to access this page.</p>}

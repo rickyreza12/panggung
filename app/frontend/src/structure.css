@@ -1,0 +1,10 @@
+.structure-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,340px),1fr));gap:1rem;align-items:start}
+.structure-list{list-style:none;margin:1rem 0;padding:0}
+.structure-list li{display:grid;grid-template-columns:1fr auto;gap:.25rem 1rem;padding:.75rem 0;border-top:1px solid var(--line);overflow-wrap:anywhere}
+.structure-list small{grid-column:1/-1;color:var(--muted)}
+.structure-form{border-top:1px solid var(--line);padding-top:1rem;margin-top:1rem}
+.structure-form p{margin:0}
+.structure-form fieldset{display:grid;gap:.75rem;border:0;padding:0;margin:0;min-width:0}
+.relations .relation-status{min-width:0;margin-left:auto;font-size:.8rem;font-weight:600;border:1px solid var(--line);border-radius:4px;padding:.15rem .5rem;color:var(--muted)}
+.relations .relation-status.resolved{color:#22533f;background:#edf7f0;border-color:#83a798}
+.relations .relation-status.unresolved{color:#78530d;background:#fff8e8;border-color:#c7a764}

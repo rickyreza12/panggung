@@ -1,7 +1,20 @@
 import { describe, expect, it, vi, afterEach } from 'vitest';
-import { ApiError, canManageUsers, canWrite, componentPath, createUserError, createUserRequest, importBody, listPath, request } from './api';
+import { ApiError, canManageUsers, canWrite, componentPath, createUserError, createUserRequest, importBody, listPath, request, structureRequest, relationStatus } from './api';
 afterEach(()=>vi.unstubAllGlobals());
 describe('catalog API',()=>{
+  it('creates qualified domains and systems with paired optional domain references',()=>{
+    const domain={namespace:'shared',name:'payments'};
+    expect(structureRequest('domains','shared','payments')).toEqual({path:'/api/catalog/domains',init:{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(domain)}});
+    expect(JSON.parse(String(structureRequest('systems','platform','billing',domain).init.body))).toEqual({namespace:'platform',name:'billing',domain_namespace:'shared',domain_name:'payments'});
+    expect(JSON.parse(String(structureRequest('systems','default','billing').init.body))).toEqual({namespace:'default',name:'billing',domain_namespace:null,domain_name:null});
+    for(const invalid of ['','../bad','Upper','name-','a'.repeat(64)]) expect(()=>structureRequest('domains','default',invalid)).toThrow('Invalid namespace or name');
+  });
+  it('distinguishes actual resolution from missing verification',()=>{
+    const relation={type:'ownedBy',targetRef:'group:default/team'};
+    expect(relationStatus({...relation,resolved:true})).toBe('Resolved');
+    expect(relationStatus({...relation,resolved:false})).toBe('Unresolved');
+    expect(relationStatus(relation)).toBe('Not checked');
+  });
   it('encodes qualified identity and search without losing namespace',()=>{
     expect(componentPath('platform.dev','billing')).toBe('/api/components/platform.dev/billing');
     const url=new URL(listPath({q:'a & b',namespace:'platform'},20,21),'http://localhost');

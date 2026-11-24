@@ -1,4 +1,4 @@
-use crate::catalog_relations::{self, Relation};
+use crate::catalog_relations::{self, ResolvedRelation};
 use crate::catalog_repository::{CatalogRepository, CatalogState, RepositoryError};
 use axum::{
     Json,
@@ -158,26 +158,30 @@ pub async fn get_qualified(
 pub async fn relations(
     State(repository): State<CatalogState>,
     Path(name): Path<String>,
-) -> Result<Json<Vec<Relation>>, ApiError> {
+) -> Result<Json<Vec<ResolvedRelation>>, ApiError> {
     relations_qualified(State(repository), Path((DEFAULT_NAMESPACE.into(), name))).await
 }
 
 pub async fn relations_qualified(
     State(repository): State<CatalogState>,
     Path((namespace, name)): Path<(String, String)>,
-) -> Result<Json<Vec<Relation>>, ApiError> {
-    let Json(component) = get_qualified(State(repository), Path((namespace, name))).await?;
+) -> Result<Json<Vec<ResolvedRelation>>, ApiError> {
+    let Json(component) = get_qualified(State(repository.clone()), Path((namespace, name))).await?;
     let Some(descriptor) = component.descriptor else {
         return Ok(Json(Vec::new()));
     };
-    catalog_relations::project(&descriptor["spec"], &component.namespace)
-        .map(Json)
-        .map_err(|_| {
+    let relations =
+        catalog_relations::project(&descriptor["spec"], &component.namespace).map_err(|_| {
             (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "Stored descriptor contains invalid references",
             )
-        })
+        })?;
+    repository
+        .resolve_relations(relations)
+        .await
+        .map(Json)
+        .map_err(internal)
 }
 
 pub async fn update(
@@ -469,9 +473,9 @@ mod tests {
         assert_eq!(
             serde_json::to_value(result).unwrap(),
             json!([
-                {"type":"ownedBy","targetRef":"user:shared/alice"},
-                {"type":"partOf","targetRef":"system:platform/billing-system"},
-                {"type":"dependsOn","targetRef":"resource:platform/database"}
+                {"type":"ownedBy","targetRef":"user:shared/alice","resolved":false},
+                {"type":"partOf","targetRef":"system:platform/billing-system","resolved":false},
+                {"type":"dependsOn","targetRef":"resource:platform/database","resolved":false}
             ])
         );
         document["spec"]["dependsOn"] = json!(["https://bad.example/path"]);

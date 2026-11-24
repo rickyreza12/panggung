@@ -16,3 +16,4 @@
 - Embedded React, TypeScript and Vite developer portal with functional catalog and team views.
 - Frontend build, lint, type checking and tests in continuous integration.
 - Administrator-only local account creation with validated roles, atomic audit records and a developer portal form.
+- Catalog target resolution, domain/system registration and integrated structure and immutable template registry views.

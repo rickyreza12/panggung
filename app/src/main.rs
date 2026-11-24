@@ -2,11 +2,13 @@ mod auth;
 mod catalog;
 mod catalog_relations;
 mod catalog_repository;
+mod catalog_structure;
 mod config;
 mod database;
 pub mod identity;
 mod organization;
 mod storage;
+mod templates;
 
 use axum::{
     Router,
@@ -58,7 +60,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     storage::validate_capabilities(&storage)?;
-    let organization_routes = organization::routes(pool.clone());
+    let organization_routes = organization::routes(pool.clone())
+        .merge(catalog_structure::routes(pool.clone()))
+        .merge(templates::routes(pool.clone()));
     let repository: CatalogState = Arc::new(SqliteCatalogRepository::new(pool));
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, config.port)).await?;
     let auth = auth::AuthState::new(identity, listener.local_addr()?.port());
