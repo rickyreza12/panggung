@@ -18,7 +18,7 @@ const MAX_OBJECT_BYTES: usize = 1024 * 1024;
 pub struct ObjectKey(String);
 
 impl ObjectKey {
-    fn parse(value: String) -> Result<Self, StatusCode> {
+    pub(crate) fn parse(value: String) -> Result<Self, StatusCode> {
         if value.len() != 32
             || !value
                 .bytes()

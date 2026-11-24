@@ -5,8 +5,10 @@ import type { Component, Fields, Filters, Relation, User } from './api';
 import Teams from './Teams';
 import Structure from './Structure';
 import Templates from './Templates';
+import Scaffolder from './Scaffolder';
+import TechDocs from './TechDocs';
 
-type View = { kind: 'catalog' | 'teams' | 'structure' | 'templates' } | { kind: 'detail' | 'edit'; namespace: string; name: string } | { kind: 'create' | 'import' };
+type View = { kind: 'catalog' | 'teams' | 'structure' | 'templates' | 'scaffolder' | 'docs' } | { kind: 'detail' | 'edit'; namespace: string; name: string } | { kind: 'create' | 'import' };
 const PAGE_SIZE = 20;
 const initialFilters: Filters = { q: '', namespace: '' };
 
@@ -174,12 +176,14 @@ export default function App(){
   if(!user&&sessionError)return <main className="login"><div className="login-panel"><Heading title="Session unavailable"/><ErrorNotice message={sessionError}/><button onClick={()=>setSessionRetry(n=>n+1)}>Try again</button></div></main>;
   if(!user)return <Login onLogin={value=>{setSessionError('');setUser(value);setView({kind:'catalog'});}}/>;
   const write=canWrite(user);
-  return <><a className="skip" href="#main">Skip to content</a><header className="topbar"><div className="brand">Panggung<span>Developer portal</span></div><nav aria-label="Main navigation"><button className="nav-link" aria-current={view.kind!=='teams'&&view.kind!=='structure'&&view.kind!=='templates'?'page':undefined} onClick={()=>navigate({kind:'catalog'})}>Catalog</button><button className="nav-link" aria-current={view.kind==='structure'?'page':undefined} onClick={()=>navigate({kind:'structure'})}>Structure</button><button className="nav-link" aria-current={view.kind==='templates'?'page':undefined} onClick={()=>navigate({kind:'templates'})}>Templates</button><button className="nav-link" aria-current={view.kind==='teams'?'page':undefined} onClick={()=>navigate({kind:'teams'})}>Teams</button></nav><div className="account"><div><strong>{user.username}</strong><small>{user.role}</small></div><button disabled={logoutBusy} onClick={logout}>{logoutBusy?'Signing out…':'Sign out'}</button></div></header>
+  return <><a className="skip" href="#main">Skip to content</a><header className="topbar"><div className="brand">Panggung<span>Developer portal</span></div><nav aria-label="Main navigation"><button className="nav-link" aria-current={view.kind!=='teams'&&view.kind!=='structure'&&view.kind!=='templates'&&view.kind!=='scaffolder'&&view.kind!=='docs'?'page':undefined} onClick={()=>navigate({kind:'catalog'})}>Catalog</button><button className="nav-link" aria-current={view.kind==='structure'?'page':undefined} onClick={()=>navigate({kind:'structure'})}>Structure</button><button className="nav-link" aria-current={view.kind==='templates'?'page':undefined} onClick={()=>navigate({kind:'templates'})}>Templates</button><button className="nav-link" aria-current={view.kind==='scaffolder'?'page':undefined} onClick={()=>navigate({kind:'scaffolder'})}>Create project</button><button className="nav-link" aria-current={view.kind==='docs'?'page':undefined} onClick={()=>navigate({kind:'docs'})}>Documentation</button><button className="nav-link" aria-current={view.kind==='teams'?'page':undefined} onClick={()=>navigate({kind:'teams'})}>Teams</button></nav><div className="account"><div><strong>{user.username}</strong><small>{user.role}</small></div><button disabled={logoutBusy} onClick={logout}>{logoutBusy?'Signing out…':'Sign out'}</button></div></header>
     <main id="main" className="workspace"><ErrorNotice message={sessionError}/>{notice&&<p className="notice" role="status">{notice}</p>}
       {view.kind==='catalog'?<Catalog write={write} navigate={navigate} run={run} filters={filters} setFilters={setFilters} offset={offset} setOffset={setOffset}/>:
       view.kind==='teams'?<Teams run={run} admin={canManageUsers(user)}/>:
       view.kind==='structure'?<Structure run={run} write={write}/>:
       view.kind==='templates'?<Templates run={run} admin={canManageUsers(user)}/>:
+      view.kind==='scaffolder'?<Scaffolder run={run} write={write}/>:
+      view.kind==='docs'?<TechDocs run={run} write={write}/>:
       view.kind==='create'&&write?<><Heading title="Register component"><p>Register a component in the default namespace.</p></Heading><ComponentForm run={run} onSaved={onSaved} cancel={()=>navigate({kind:'catalog'})}/></>:
       view.kind==='import'&&write?<ImportForm run={run} onSaved={onSaved} cancel={()=>navigate({kind:'catalog'})}/>:
       view.kind==='detail'||view.kind==='edit'?<Detail key={view.kind+'/'+view.namespace+'/'+view.name} namespace={view.namespace} name={view.name} editing={view.kind==='edit'} write={write} run={run} navigate={navigate} onSaved={onSaved} onDeleted={()=>{setView({kind:'catalog'});setNotice('Component deleted.');}}/>:<p role="alert">You do not have permission to access this page.</p>}
