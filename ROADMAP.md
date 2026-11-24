@@ -55,7 +55,8 @@ No implementation phase is complete until actual checks have passed. Use phase-s
 
 - Phase 00: repository, license, contribution and security documentation established; public main branch verified.
 - Phase 01: local Rust server, typed configuration, graceful shutdown handler and health/readiness endpoints. Formatting, strict Clippy, debug build, two automated tests and live loopback smoke checks passed on Windows. Shutdown handler exists but graceful shutdown behavior was not independently tested.
-- Phase 02: partial. SQLite migrations and persistence across database reopen verified; local object storage and replaceable provider contracts remain outstanding.
-- Phase 03: partial. Component registration and listing verified; editing, search and Backstage descriptor import remain outstanding.
+- Phase 02: partial. SQLite migrations and persistence across database reopen verified; immutable local object storage upload, download, duplicate rejection and invalid key rejection verified. Replaceable provider contracts remain outstanding.
+- Phase 03: partial. Registration, listing, detail, update, deletion, search, pagination and limited Backstage JSON Component import verified. Import currently projects only name, description and owner; broader metadata preservation, YAML support and frontend management remain outstanding.
+- Latest local verification: cargo fmt --check, strict Clippy, four automated tests, debug build and live loopback import, update, search, object upload/download and deletion passed on Windows.
 
 Production readiness requires verified authentication, authorization, backup and restore, secure deployment, dependency review and documented operational limits. The current loopback-only preview is not a production release.
