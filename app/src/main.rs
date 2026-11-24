@@ -1,8 +1,9 @@
 mod catalog;
+mod config;
+mod database;
 
-use axum::{Router, response::Html, routing::get};
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
-use std::{net::Ipv4Addr, path::PathBuf};
+use axum::{Router, extract::State, http::StatusCode, response::Html, routing::get};
+use std::net::Ipv4Addr;
 use tokio::net::TcpListener;
 
 #[tokio::main]
@@ -10,25 +11,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
-    let port = std::env::var("PANGGUNG_PORT")
-        .unwrap_or_else(|_| "3000".to_owned())
-        .parse::<u16>()?;
-    let data =
-        PathBuf::from(std::env::var_os("PANGGUNG_DATA_DIR").unwrap_or_else(|| "data".into()));
-    std::fs::create_dir_all(&data)?;
-    let pool = SqlitePoolOptions::new()
-        .max_connections(4)
-        .connect_with(
-            SqliteConnectOptions::new()
-                .filename(data.join("panggung.db"))
-                .create_if_missing(true)
-                .foreign_keys(true)
-                .journal_mode(SqliteJournalMode::Wal)
-                .busy_timeout(std::time::Duration::from_secs(5)),
-        )
-        .await?;
-    sqlx::migrate!().run(&pool).await?;
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?;
+    let config = config::Config::load()?;
+    std::fs::create_dir_all(&config.data_dir)?;
+    let pool = database::open(&config.data_dir.join("panggung.db")).await?;
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, config.port)).await?;
     println!("Panggung listening on http://{}", listener.local_addr()?);
     axum::serve(listener, router(pool))
         .with_graceful_shutdown(async {
@@ -42,8 +28,19 @@ fn router(pool: sqlx::SqlitePool) -> Router {
     Router::new()
         .route("/", get(|| async { Html(include_str!("index.html")) }))
         .route("/health", get(|| async { "ok" }))
+        .route("/ready", get(ready))
         .route("/api/components", get(catalog::list).post(catalog::create))
         .with_state(pool)
+}
+
+async fn ready(State(pool): State<sqlx::SqlitePool>) -> (StatusCode, &'static str) {
+    match sqlx::query_scalar::<_, i64>("SELECT 1")
+        .fetch_one(&pool)
+        .await
+    {
+        Ok(1) => (StatusCode::OK, "ready"),
+        _ => (StatusCode::SERVICE_UNAVAILABLE, "database unavailable"),
+    }
 }
 
 #[cfg(test)]
@@ -58,16 +55,7 @@ mod tests {
     #[tokio::test]
     async fn catalog_round_trip_and_validation() {
         let dir = tempfile::tempdir().unwrap();
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(
-                SqliteConnectOptions::new()
-                    .filename(dir.path().join("test.db"))
-                    .create_if_missing(true),
-            )
-            .await
-            .unwrap();
-        sqlx::migrate!().run(&pool).await.unwrap();
+        let pool = database::open(&dir.path().join("test.db")).await.unwrap();
         let app = router(pool);
         let request = |name: &str| {
             Request::builder()
