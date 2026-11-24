@@ -1,13 +1,17 @@
+mod auth;
 mod catalog;
+mod catalog_relations;
 mod catalog_repository;
 mod config;
 mod database;
+pub mod identity;
+mod organization;
 mod storage;
 
 use axum::{
     Router,
     extract::{DefaultBodyLimit, State},
-    http::StatusCode,
+    http::{StatusCode, header},
     response::Html,
     routing::get,
 };
@@ -22,22 +26,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
     let config = config::Config::load()?;
     std::fs::create_dir_all(&config.data_dir)?;
+    let pool = match config.database_provider {
+        config::DatabaseProvider::Sqlite => {
+            database::open(&config.data_dir.join("panggung.db")).await?
+        }
+    };
+    let identity = identity::IdentityStore::new(pool.clone());
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if !args.is_empty() {
+        if let [command, username] = args.as_slice()
+            && command == "bootstrap-admin"
+        {
+            use std::io::IsTerminal;
+            if !std::io::stdin().is_terminal() {
+                return Err("Bootstrap requires an interactive terminal".into());
+            }
+            let password = rpassword::prompt_password("Password: ")?;
+            let confirmation = rpassword::prompt_password("Confirm password: ")?;
+            if password != confirmation {
+                return Err("Passwords do not match".into());
+            }
+            identity.bootstrap_admin(username, &password).await?;
+            println!("Initial administrator created");
+            return Ok(());
+        }
+        return Err("Usage: panggung [bootstrap-admin <username>]".into());
+    }
     let storage = match config.storage_provider {
         config::ObjectStorageProvider::Local => {
             storage::LocalStorage::open(config.data_dir.join("objects"))?
         }
     };
     storage::validate_capabilities(&storage)?;
-    let repository: CatalogState = match config.database_provider {
-        config::DatabaseProvider::Sqlite => Arc::new(SqliteCatalogRepository::new(
-            database::open(&config.data_dir.join("panggung.db")).await?,
-        )),
-    };
+    let organization_routes = organization::routes(pool.clone());
+    let repository: CatalogState = Arc::new(SqliteCatalogRepository::new(pool));
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, config.port)).await?;
+    let auth = auth::AuthState::new(identity, listener.local_addr()?.port());
     println!("Panggung listening on http://{}", listener.local_addr()?);
     axum::serve(
         listener,
-        repository_router(repository).merge(storage.routes()),
+        production_router(repository, storage.routes(), organization_routes, auth),
     )
     .with_graceful_shutdown(async {
         let _ = tokio::signal::ctrl_c().await;
@@ -48,14 +76,78 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 fn router(pool: sqlx::SqlitePool) -> Router {
-    repository_router(Arc::new(SqliteCatalogRepository::new(pool)))
+    let repository: CatalogState = Arc::new(SqliteCatalogRepository::new(pool));
+    public_router(repository.clone()).merge(repository_router(repository))
+}
+
+fn production_router(
+    repository: CatalogState,
+    storage: Router,
+    organization: Router,
+    auth: auth::AuthState,
+) -> Router {
+    let protected = auth::protect(
+        repository_router(repository.clone())
+            .merge(storage)
+            .merge(organization),
+        auth.clone(),
+    );
+    public_router(repository)
+        .merge(auth::routes(auth))
+        .merge(protected)
+}
+
+fn public_router(repository: CatalogState) -> Router {
+    Router::new()
+        .route(
+            "/",
+            get(|| async {
+                (
+                    [
+                        (
+                            header::CONTENT_SECURITY_POLICY,
+                            "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+                        ),
+                        (header::CACHE_CONTROL, "no-cache"),
+                        (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+                    ],
+                    Html(include_str!("web/index.html")),
+                )
+            }),
+        )
+        .route(
+            "/assets/app.js",
+            get(|| async {
+                (
+                    [
+                        (header::CONTENT_TYPE, "application/javascript; charset=utf-8"),
+                        (header::CACHE_CONTROL, "no-cache"),
+                        (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+                    ],
+                    include_str!("web/assets/app.js"),
+                )
+            }),
+        )
+        .route(
+            "/assets/index.css",
+            get(|| async {
+                (
+                    [
+                        (header::CONTENT_TYPE, "text/css; charset=utf-8"),
+                        (header::CACHE_CONTROL, "no-cache"),
+                        (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+                    ],
+                    include_str!("web/assets/index.css"),
+                )
+            }),
+        )
+        .route("/health", get(|| async { "ok" }))
+        .route("/ready", get(ready))
+        .with_state(repository)
 }
 
 fn repository_router(repository: CatalogState) -> Router {
     Router::new()
-        .route("/", get(|| async { Html(include_str!("index.html")) }))
-        .route("/health", get(|| async { "ok" }))
-        .route("/ready", get(ready))
         .route("/api/components", get(catalog::list).post(catalog::create))
         .route(
             "/api/catalog/import",
@@ -64,6 +156,11 @@ fn repository_router(repository: CatalogState) -> Router {
         .route(
             "/api/catalog/import/yaml",
             axum::routing::post(catalog::import_yaml).layer(DefaultBodyLimit::max(64 * 1024)),
+        )
+        .route("/api/catalog/relations/{name}", get(catalog::relations))
+        .route(
+            "/api/catalog/relations/{namespace}/{name}",
+            get(catalog::relations_qualified),
         )
         .route(
             "/api/components/{name}",
@@ -95,6 +192,197 @@ mod tests {
         http::{Request, StatusCode},
     };
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn production_routes_enforce_sessions_roles_and_origin() {
+        use rand_core::{OsRng, RngCore};
+        let dir = tempfile::tempdir().unwrap();
+        let pool = database::open(&dir.path().join("auth.db")).await.unwrap();
+        let identity = identity::IdentityStore::new(pool.clone());
+        let mut random = [0_u8; 32];
+        OsRng.fill_bytes(&mut random);
+        let password: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
+        let admin = identity.bootstrap_admin("admin", &password).await.unwrap();
+        identity
+            .create_user(admin.id, "viewer", &password, identity::Role::Viewer)
+            .await
+            .unwrap();
+        identity
+            .create_user(admin.id, "member", &password, identity::Role::Member)
+            .await
+            .unwrap();
+        let app = production_router(
+            Arc::new(SqliteCatalogRepository::new(pool.clone())),
+            storage::LocalStorage::open(dir.path().join("objects"))
+                .unwrap()
+                .routes(),
+            organization::routes(pool),
+            auth::AuthState::new(identity, 3000),
+        );
+        let request = |method: &str, uri: &str, cookie: &str, origin: &str, body: String| {
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("host", "127.0.0.1:3000")
+                .header("origin", origin)
+                .header("cookie", cookie)
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap()
+        };
+        let origin = "http://127.0.0.1:3000";
+        let object = "/api/objects/0123456789abcdef0123456789abcdef";
+        for (method, path) in [
+            ("GET", "/api/components"),
+            ("POST", "/api/components"),
+            ("GET", "/api/components/default/service"),
+            ("PUT", "/api/components/service"),
+            ("DELETE", "/api/components/default/service"),
+            ("POST", "/api/catalog/import"),
+            ("POST", "/api/catalog/import/yaml"),
+            ("GET", "/api/catalog/relations/service"),
+            ("GET", "/api/catalog/relations/default/service"),
+            ("GET", object),
+            ("PUT", object),
+            ("GET", "/api/auth/me"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(request(method, path, "", origin, String::new()))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {path}"
+            );
+        }
+        let login_body = |username: &str| {
+            serde_json::json!({"username":username,"password":password}).to_string()
+        };
+        let cross = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/api/auth/login",
+                "",
+                "http://example.invalid",
+                login_body("admin"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(cross.status(), StatusCode::FORBIDDEN);
+        let mut cookies = Vec::new();
+        for username in ["admin", "member", "viewer"] {
+            let response = app
+                .clone()
+                .oneshot(request(
+                    "POST",
+                    "/api/auth/login",
+                    "",
+                    origin,
+                    login_body(username),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let cookie = response.headers()["set-cookie"].to_str().unwrap();
+            assert!(
+                cookie.contains("HttpOnly")
+                    && cookie.contains("SameSite=Strict")
+                    && cookie.contains("Max-Age=86400")
+                    && !cookie.contains("Domain=")
+            );
+            cookies.push(cookie.split(';').next().unwrap().to_owned());
+            let body = to_bytes(response.into_body(), 4096).await.unwrap();
+            let user: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(user["username"], username);
+            assert_eq!(user["role"], username);
+            assert!(user.get("password_hash").is_none() && user.get("token").is_none());
+        }
+        let component =
+            serde_json::json!({"name":"service","description":"demo","owner":"team"}).to_string();
+        for (index, method, path, body, expected) in [
+            (2, "GET", "/api/components", String::new(), StatusCode::OK),
+            (
+                2,
+                "POST",
+                "/api/components",
+                component.clone(),
+                StatusCode::FORBIDDEN,
+            ),
+            (2, "PUT", object, "demo".into(), StatusCode::FORBIDDEN),
+            (
+                1,
+                "POST",
+                "/api/components",
+                component.clone(),
+                StatusCode::CREATED,
+            ),
+            (0, "PUT", object, "demo".into(), StatusCode::CREATED),
+            (2, "GET", object, String::new(), StatusCode::OK),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(request(method, path, &cookies[index], origin, body))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "{method} {path}");
+        }
+        let response = app
+            .clone()
+            .oneshot(request(
+                "DELETE",
+                "/api/components/service",
+                &cookies[0],
+                "http://example.invalid",
+                String::new(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let response = app
+            .clone()
+            .oneshot(request(
+                "GET",
+                "/api/auth/me",
+                &cookies[2],
+                origin,
+                String::new(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/api/auth/logout",
+                &cookies[2],
+                origin,
+                String::new(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(
+            response.headers()["set-cookie"]
+                .to_str()
+                .unwrap()
+                .contains("Max-Age=0")
+        );
+        let response = app
+            .oneshot(request(
+                "GET",
+                "/api/components",
+                &cookies[2],
+                origin,
+                String::new(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
 
     async fn call(
         app: &Router,

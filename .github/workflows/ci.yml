@@ -12,6 +12,26 @@ jobs:
         working-directory: app
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: app/frontend/package-lock.json
+      - name: Install frontend dependencies
+        run: npm ci --legacy-peer-deps --no-audit --no-fund
+        working-directory: app/frontend
+      - name: Verify frontend
+        working-directory: app/frontend
+        run: |
+          npm run typecheck
+          npm run lint
+          npm run test
+          npm run build
+      - name: Verify embedded frontend matches source
+        run: |
+          node app/scripts/sync-frontend.mjs
+          git diff --exit-code -- app/src/web
+        working-directory: .
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy

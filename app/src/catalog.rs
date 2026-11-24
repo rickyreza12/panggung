@@ -1,3 +1,4 @@
+use crate::catalog_relations::{self, Relation};
 use crate::catalog_repository::{CatalogRepository, CatalogState, RepositoryError};
 use axum::{
     Json,
@@ -154,6 +155,31 @@ pub async fn get_qualified(
         .ok_or((StatusCode::NOT_FOUND, "Component not found"))
 }
 
+pub async fn relations(
+    State(repository): State<CatalogState>,
+    Path(name): Path<String>,
+) -> Result<Json<Vec<Relation>>, ApiError> {
+    relations_qualified(State(repository), Path((DEFAULT_NAMESPACE.into(), name))).await
+}
+
+pub async fn relations_qualified(
+    State(repository): State<CatalogState>,
+    Path((namespace, name)): Path<(String, String)>,
+) -> Result<Json<Vec<Relation>>, ApiError> {
+    let Json(component) = get_qualified(State(repository), Path((namespace, name))).await?;
+    let Some(descriptor) = component.descriptor else {
+        return Ok(Json(Vec::new()));
+    };
+    catalog_relations::project(&descriptor["spec"], &component.namespace)
+        .map(Json)
+        .map_err(|_| {
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "Stored descriptor contains invalid references",
+            )
+        })
+}
+
 pub async fn update(
     State(repository): State<CatalogState>,
     Path(name): Path<String>,
@@ -176,6 +202,13 @@ pub async fn update_qualified(
     let component = validate(input)?;
     if name != component.name {
         return Err((StatusCode::BAD_REQUEST, "Component names cannot be changed"));
+    }
+    if let Some(existing) = repository.get(&namespace, &name).await.map_err(internal)?
+        && let Some(mut descriptor) = existing.descriptor
+    {
+        descriptor["spec"]["owner"] = Value::String(component.owner.clone());
+        catalog_relations::project(&descriptor["spec"], &namespace)
+            .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid entity reference"))?;
     }
     repository
         .update(&namespace, &name, &component.description, &component.owner)
@@ -280,12 +313,13 @@ fn validate_descriptor(mut document: Value) -> Result<Component, ApiError> {
         return Err((StatusCode::BAD_REQUEST, "Unsupported component descriptor"));
     }
     validate_metadata(&document["metadata"])?;
-    validate_spec(&document["spec"])?;
     let namespace = input
         .metadata
         .namespace
         .unwrap_or_else(|| DEFAULT_NAMESPACE.into());
     validate_namespace(&namespace)?;
+    catalog_relations::project(&document["spec"], &namespace)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid entity reference"))?;
     let mut component = validate(NewComponent {
         name: input.metadata.name,
         description: input.metadata.description,
@@ -331,29 +365,6 @@ fn validate_metadata(metadata: &Value) -> Result<(), ApiError> {
     for field in ["title", "namespace"] {
         if let Some(value) = metadata.get(field)
             && !value.is_string()
-        {
-            return Err(invalid);
-        }
-    }
-    Ok(())
-}
-
-fn validate_spec(spec: &Value) -> Result<(), ApiError> {
-    let invalid = (StatusCode::BAD_REQUEST, "Invalid descriptor specification");
-    for field in ["system", "subcomponentOf"] {
-        if let Some(value) = spec.get(field)
-            && value.as_str().is_none_or(|value| value.trim().is_empty())
-        {
-            return Err(invalid);
-        }
-    }
-    for field in ["providesApis", "consumesApis", "dependsOn", "dependencyOf"] {
-        if let Some(value) = spec.get(field)
-            && !value.as_array().is_some_and(|items| {
-                items
-                    .iter()
-                    .all(|item| item.as_str().is_some_and(|value| !value.trim().is_empty()))
-            })
         {
             return Err(invalid);
         }
@@ -424,6 +435,68 @@ mod tests {
             },
             "spec": {"type": "service", "lifecycle": "production", "owner": "team-a", "dependsOn": ["resource:database"]}
         })
+    }
+
+    #[tokio::test]
+    async fn relations_are_qualified_and_descriptor_derived() {
+        let dir = tempfile::tempdir().unwrap();
+        let repository = state(
+            crate::database::open(&dir.path().join("catalog.db"))
+                .await
+                .unwrap(),
+        );
+        let mut document = descriptor();
+        document["metadata"]["namespace"] = json!("platform");
+        document["spec"]["owner"] = json!("User:Shared/Alice");
+        document["spec"]["system"] = json!("billing-system");
+        let (status, Json(_)) = import_document(repository.as_ref(), document.clone())
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(
+            relations(State(repository.clone()), Path("billing".into()))
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::NOT_FOUND
+        );
+        let Json(result) = relations_qualified(
+            State(repository.clone()),
+            Path(("platform".into(), "billing".into())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(result).unwrap(),
+            json!([
+                {"type":"ownedBy","targetRef":"user:shared/alice"},
+                {"type":"partOf","targetRef":"system:platform/billing-system"},
+                {"type":"dependsOn","targetRef":"resource:platform/database"}
+            ])
+        );
+        document["spec"]["dependsOn"] = json!(["https://bad.example/path"]);
+        assert_eq!(
+            import_document(repository.as_ref(), document)
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+        let (status, Json(_)) = create(
+            State(repository.clone()),
+            Json(NewComponent {
+                name: "manual".into(),
+                description: "".into(),
+                owner: "Legacy owner label".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::CREATED);
+        let Json(result) = relations(State(repository), Path("manual".into()))
+            .await
+            .unwrap();
+        assert!(result.is_empty());
     }
 
     #[tokio::test]
