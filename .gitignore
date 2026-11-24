@@ -1,0 +1,14 @@
+/workspaces/
+/app/target/
+/app/data/
+/app/frontend/node_modules/
+/app/frontend/dist/
+.env
+.env.*
+!.env.example
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.log
