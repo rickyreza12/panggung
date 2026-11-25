@@ -84,6 +84,28 @@ impl From<()> for RemoteFailure {
         Self::Unresolved
     }
 }
+fn branch_sha(reference: &Value) -> Result<String, RemoteFailure> {
+    if reference["ref"].as_str() != Some("refs/heads/main")
+        || reference["object"]["type"].as_str() != Some("commit")
+    {
+        return Err(RemoteFailure::Conflict);
+    }
+    Ok(sha(&reference["object"]["sha"])?)
+}
+
+fn verify_repository(repo: &Value, destination: &str, id: i64) -> Result<(), RemoteFailure> {
+    if repo["id"].as_i64() != Some(id)
+        || repo["private"].as_bool() != Some(true)
+        || !repo["full_name"]
+            .as_str()
+            .is_some_and(|s| s.eq_ignore_ascii_case(destination))
+        || repo["default_branch"].as_str() != Some("main")
+        || repo["archived"].as_bool() != Some(false)
+    {
+        return Err(RemoteFailure::Conflict);
+    }
+    Ok(())
+}
 
 type RemoteFuture<'a> =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, RemoteFailure>> + Send + 'a>>;
@@ -248,19 +270,10 @@ impl GitHub {
         use reqwest::Method;
         let root = format!("/repos/{destination}");
         let repo = self.call(Method::GET, &root, None).await?;
-        if repo["id"].as_i64() != Some(id)
-            || repo["private"].as_bool() != Some(true)
-            || !repo["full_name"]
-                .as_str()
-                .is_some_and(|s| s.eq_ignore_ascii_case(destination))
-            || repo["default_branch"].as_str() != Some("main")
-            || repo["archived"].as_bool() != Some(false)
-        {
-            return Err(RemoteFailure::Conflict);
-        }
+        verify_repository(&repo, destination, id)?;
         let reference = format!("{root}/git/ref/heads/main");
         let head = self.call(Method::GET, &reference, None).await?;
-        if sha(&head["object"]["sha"])? != baseline {
+        if branch_sha(&head)? != baseline {
             return Err(RemoteFailure::Conflict);
         }
         let commit = self
@@ -305,7 +318,7 @@ impl GitHub {
         self.verify_candidate(&root, &recovery, files).await?;
         intent.candidate(&commit, &tree).await?;
         let head = self.call(Method::GET, &reference, None).await?;
-        if sha(&head["object"]["sha"])? != baseline {
+        if branch_sha(&head)? != baseline {
             return Err(RemoteFailure::Conflict);
         }
         let updated = self
@@ -315,7 +328,7 @@ impl GitHub {
                 Some(json!({"sha":commit,"force":false})),
             )
             .await?;
-        if sha(&updated["object"]["sha"])? != commit {
+        if branch_sha(&updated).map_err(|_| RemoteFailure::Unresolved)? != commit {
             return Err(RemoteFailure::Unresolved);
         }
         self.reconcile(&recovery, files).await
@@ -350,19 +363,11 @@ impl Remote for GitHub {
             let destination = format!("{}/{}", r.owner, r.repo);
             let root = format!("/repos/{destination}");
             let repo = self.call(Method::GET, &root, None).await?;
-            if repo["id"].as_i64() != Some(r.repository_id)
-                || repo["private"].as_bool() != Some(true)
-                || !repo["full_name"]
-                    .as_str()
-                    .is_some_and(|v| v.eq_ignore_ascii_case(&destination))
-                || repo["default_branch"].as_str() != Some("main")
-            {
-                return Err(RemoteFailure::Conflict);
-            }
+            verify_repository(&repo, &destination, r.repository_id)?;
             let head = self
                 .call(Method::GET, &format!("{root}/git/ref/heads/main"), None)
                 .await?;
-            let head_sha = sha(&head["object"]["sha"])?;
+            let head_sha = branch_sha(&head)?;
             if head_sha != r.candidate_sha {
                 return Err(if head_sha == r.baseline_sha {
                     RemoteFailure::Unresolved
@@ -374,7 +379,7 @@ impl Remote for GitHub {
             let final_head = self
                 .call(Method::GET, &format!("{root}/git/ref/heads/main"), None)
                 .await?;
-            if sha(&final_head["object"]["sha"])? != r.candidate_sha {
+            if branch_sha(&final_head)? != r.candidate_sha {
                 return Err(RemoteFailure::Conflict);
             }
             Ok(r.candidate_sha.clone())
@@ -726,26 +731,58 @@ mod tests {
             "none",
             "privacy",
             "identity",
+            "name",
+            "archive",
+            "archive_missing",
+            "default_branch",
+            "wrong_ref",
+            "missing_ref",
+            "wrong_type",
+            "missing_type",
+            "bad_sha",
             "head",
             "parent",
             "truncated",
             "content",
             "missing",
+            "final_ref",
         ] {
             let mut fixtures = std::collections::VecDeque::new();
             let mut add = |path: String, value: Value| {
                 fixtures.push_back((Method::GET, path, None, Ok(value)))
             };
-            add(
-                root.into(),
-                json!({"id":if defect=="identity"{124}else{123},"private":defect!="privacy","full_name":"allowed/service","default_branch":"main"}),
-            );
-            if !matches!(defect, "privacy" | "identity") {
-                add(
-                    format!("{root}/git/ref/heads/main"),
-                    json!({"object":{"sha":if defect=="head"{&baseline}else{&candidate}}}),
-                );
-                if defect != "head" {
+            let mut repository = json!({"id":if defect=="identity"{124}else{123},"private":defect!="privacy","full_name":if defect=="name"{"allowed/other"}else{"allowed/service"},"default_branch":if defect=="default_branch"{"other"}else{"main"},"archived":defect=="archive"});
+            if defect == "archive_missing" {
+                repository.as_object_mut().unwrap().remove("archived");
+            }
+            add(root.into(), repository);
+            if !matches!(
+                defect,
+                "privacy" | "identity" | "name" | "archive" | "archive_missing" | "default_branch"
+            ) {
+                let mut head = json!({"ref":"refs/heads/main","object":{"type":"commit","sha":if defect=="head"{&baseline}else{&candidate}}});
+                match defect {
+                    "wrong_ref" => head["ref"] = json!("refs/heads/main-other"),
+                    "missing_ref" => {
+                        head.as_object_mut().unwrap().remove("ref");
+                    }
+                    "wrong_type" => head["object"]["type"] = json!("tag"),
+                    "missing_type" => {
+                        head["object"].as_object_mut().unwrap().remove("type");
+                    }
+                    "bad_sha" => head["object"]["sha"] = json!("invalid"),
+                    _ => {}
+                }
+                add(format!("{root}/git/ref/heads/main"), head);
+                if !matches!(
+                    defect,
+                    "head"
+                        | "wrong_ref"
+                        | "missing_ref"
+                        | "wrong_type"
+                        | "missing_type"
+                        | "bad_sha"
+                ) {
                     add(
                         format!("{root}/git/commits/{candidate}"),
                         json!({"sha":candidate,"tree":{"sha":tree},"parents":[{"sha":if defect=="parent"{&candidate}else{&baseline}}]}),
@@ -764,12 +801,12 @@ mod tests {
                     }
                 }
             }
-            if defect == "none" {
+            if matches!(defect, "none" | "final_ref") {
                 fixtures.push_back((
                     Method::GET,
                     format!("{root}/git/ref/heads/main"),
                     None,
-                    Ok(json!({"object":{"sha":candidate}})),
+                    Ok(json!({"ref":if defect=="final_ref"{"refs/heads/other"}else{"refs/heads/main"},"object":{"type":"commit","sha":candidate}})),
                 ));
             }
             let remote = GitHub {
@@ -824,7 +861,9 @@ mod tests {
             "truncated",
             "database",
             "conflict",
+            "prepatch_ref",
             "ambiguous",
+            "patch_type",
             "success",
         ] {
             // Only disposable synthetic reservations are removed between cases.
@@ -851,7 +890,7 @@ mod tests {
                 Method::GET,
                 format!("{root}/git/ref/heads/main"),
                 None,
-                Ok(json!({"object":{"sha":baseline}})),
+                Ok(json!({"ref":"refs/heads/main","object":{"type":"commit","sha":baseline}})),
             );
             add(
                 Method::GET,
@@ -909,9 +948,11 @@ mod tests {
                         Method::GET,
                         format!("{root}/git/ref/heads/main"),
                         None,
-                        Ok(json!({"object":{"sha":if defect=="conflict"{&blob}else{&baseline}}})),
+                        Ok(
+                            json!({"ref":if defect=="prepatch_ref"{"refs/heads/other"}else{"refs/heads/main"},"object":{"type":"commit","sha":if defect=="conflict"{&blob}else{&baseline}}}),
+                        ),
                     );
-                    if defect != "conflict" {
+                    if !matches!(defect, "conflict" | "prepatch_ref") {
                         add(
                             Method::PATCH,
                             format!("{root}/git/refs/heads/main"),
@@ -919,7 +960,9 @@ mod tests {
                             if defect == "ambiguous" {
                                 Err(())
                             } else {
-                                Ok(json!({"object":{"sha":candidate}}))
+                                Ok(
+                                    json!({"ref":"refs/heads/main","object":{"type":if defect=="patch_type"{"tag"}else{"commit"},"sha":candidate}}),
+                                )
                             },
                         );
                         if defect == "success" {
@@ -928,7 +971,9 @@ mod tests {
                                 Method::GET,
                                 format!("{root}/git/ref/heads/main"),
                                 None,
-                                Ok(json!({"object":{"sha":candidate}})),
+                                Ok(
+                                    json!({"ref":"refs/heads/main","object":{"type":"commit","sha":candidate}}),
+                                ),
                             );
                             add(
                                 Method::GET,
@@ -961,7 +1006,7 @@ mod tests {
                     Method::GET,
                     format!("{root}/git/ref/heads/main"),
                     None,
-                    Ok(json!({"object":{"sha":candidate}})),
+                    Ok(json!({"ref":"refs/heads/main","object":{"type":"commit","sha":candidate}})),
                 ));
             }
             let remote = GitHub {
@@ -973,6 +1018,12 @@ mod tests {
                 .run("allowed/service", 123, &baseline, &files, &intent)
                 .await;
             assert_eq!(result.is_ok(), defect == "success", "{defect}");
+            if defect == "patch_type" {
+                assert_eq!(result, Err(RemoteFailure::Unresolved));
+            }
+            if defect == "prepatch_ref" {
+                assert_eq!(result, Err(RemoteFailure::Conflict));
+            }
             assert!(remote.fixtures.as_ref().unwrap().lock().unwrap().is_empty());
             let record:(String,Option<String>)=sqlx::query_as("SELECT mutation_stage,candidate_sha FROM github_artifact_publications WHERE job_id=1").fetch_one(&pool).await.unwrap();
             if matches!(defect, "nonempty" | "truncated" | "database") {
