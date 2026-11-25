@@ -524,9 +524,7 @@ async fn process_one(
     } else {
         match result {
             Ok((description, branch, archived, descriptor)) => {
-                sqlx::query("UPDATE github_repositories SET description=?,default_branch=?,archived=?,descriptor_status=?,synced_at=unixepoch() WHERE github_id=? AND owner=? COLLATE NOCASE AND name=? COLLATE NOCASE")
-                .bind(description).bind(branch).bind(archived).bind(descriptor).bind(job.github_id).bind(&job.owner).bind(&job.repo).execute(&mut *tx).await?;
-                if let Some((namespace, name, owner, target_revision)) = target {
+                let disposition = if let Some((namespace, name, owner, target_revision)) = target {
                     match catalog {
                         Some(Ok(component))
                             if target_revision.is_some()
@@ -560,7 +558,12 @@ async fn process_one(
                     }
                 } else {
                     ("succeeded", "canonical_metadata_refreshed", 0)
+                };
+                if disposition.0 == "succeeded" {
+                    sqlx::query("UPDATE github_repositories SET description=?,default_branch=?,archived=?,descriptor_status=?,synced_at=unixepoch() WHERE github_id=? AND owner=? COLLATE NOCASE AND name=? COLLATE NOCASE")
+                .bind(description).bind(branch).bind(archived).bind(descriptor).bind(job.github_id).bind(&job.owner).bind(&job.repo).execute(&mut *tx).await?;
                 }
+                disposition
             }
             Err((code, _))
                 if code == StatusCode::CONFLICT
@@ -873,6 +876,24 @@ mod tests {
             ))
         }
         async fn descriptor(&self, _owner: &str, _repo: &str, _branch: &str) -> DescriptorResult {
+            match self.scenario {
+                "descriptor_rate" => {
+                    return Err((
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "synthetic descriptor rate limit",
+                    ));
+                }
+                "descriptor_invalid" => {
+                    return Err((
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        "synthetic invalid descriptor",
+                    ));
+                }
+                "descriptor_error" => {
+                    return Err((StatusCode::BAD_GATEWAY, "synthetic upstream error"));
+                }
+                _ => {}
+            }
             crate::catalog::validate_descriptor(json!({
                 "apiVersion":"backstage.io/v1alpha1","kind":"Component",
                 "metadata":{"name":"service","description":"canonical"},
@@ -883,7 +904,17 @@ mod tests {
     #[tokio::test]
     async fn canonical_worker_persists_and_fences_local_changes() {
         for scenario in [
-            "success", "manual", "delete", "revoke", "registry", "owner", "rate", "restart",
+            "success",
+            "manual",
+            "delete",
+            "revoke",
+            "registry",
+            "owner",
+            "rate",
+            "restart",
+            "descriptor_rate",
+            "descriptor_invalid",
+            "descriptor_error",
         ] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("fixture.db");
@@ -934,8 +965,12 @@ mod tests {
                     assert_eq!(lifecycle.as_deref(), Some("production"));
                     assert!(descriptor.unwrap().contains("component:default/dependency"));
                 }
-                "rate" => {
+                "rate" | "descriptor_rate" | "descriptor_error" => {
                     assert_eq!(state, "queued");
+                    assert_eq!(description, "original");
+                }
+                "descriptor_invalid" => {
+                    assert_eq!(state, "unsupported");
                     assert_eq!(description, "original");
                 }
                 _ => {
@@ -943,6 +978,21 @@ mod tests {
                     assert_ne!(description, "canonical", "{scenario}");
                 }
             }
+            let repository_description: Option<String> = sqlx::query_scalar(
+                "SELECT description FROM github_repositories WHERE github_id=123",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                repository_description.as_deref(),
+                match scenario {
+                    "success" | "restart" => Some("upstream"),
+                    "registry" => Some("manual"),
+                    _ => None,
+                },
+                "{scenario}: rejected refresh must not modify repository metadata"
+            );
             assert_eq!(
                 sqlx::query_scalar::<_, i64>(
                     "SELECT synced_by FROM github_repositories WHERE github_id=123"

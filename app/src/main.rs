@@ -1,3 +1,5 @@
+#[cfg(all(feature = "acceptance-fixture", not(debug_assertions)))]
+compile_error!("The acceptance fixture must not be included in release builds.");
 mod artifact_publish;
 mod auth;
 mod catalog;
@@ -33,6 +35,32 @@ use tokio::net::TcpListener;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(feature = "acceptance-fixture")]
+    {
+        if std::env::args().nth(1).as_deref() == Some("--acceptance-fixture-check") {
+            println!("panggung-loopback-fixture");
+            return Ok(());
+        }
+        // Reject inherited credentials before any external provider is constructed.
+        if std::env::vars_os().any(|(key, _)| {
+            let key = key.to_string_lossy();
+            key.starts_with("PANGGUNG_GITHUB_") && key != "PANGGUNG_GITHUB_WEBHOOK_SECRET"
+        }) || std::env::var("PANGGUNG_OTLP_ENABLED").as_deref() != Ok("false")
+        {
+            return Err(
+                "Acceptance fixture forbids GitHub credentials and telemetry export".into(),
+            );
+        }
+        if std::env::var("PANGGUNG_ACCEPTANCE_UPSTREAM_PORT")
+            .ok()
+            .and_then(|v| v.parse::<u16>().ok())
+            .filter(|p| *p != 0)
+            .is_none()
+        {
+            return Err("Acceptance fixture requires loopback upstream port".into());
+        }
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
@@ -97,23 +125,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, config.port)).await?;
     let auth = auth::AuthState::new(identity, listener.local_addr()?.port());
     println!("Panggung listening on http://{}", listener.local_addr()?);
-    axum::serve(
+    let server_result = axum::serve(
         listener,
         observability::instrument(
             production_router(repository, storage.routes(), organization_routes, auth)
                 .merge(webhook_receiver)
                 .merge(observability::scrape_routes(metrics.clone())),
-            metrics,
+            metrics.clone(),
         ),
     )
     .with_graceful_shutdown(async {
         let _ = tokio::signal::ctrl_c().await;
     })
-    .await?;
+    .await;
     if let Some(worker) = webhook_worker {
         worker.abort();
         let _ = worker.await;
     }
+    metrics.shutdown().await;
+    server_result?;
     Ok(())
 }
 

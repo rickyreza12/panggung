@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use std::{sync::Arc, time::Duration};
 
+#[cfg(any(test, not(feature = "acceptance-fixture")))]
 const API: &str = "https://api.github.com";
 const MAX_BODY: usize = 2 * 1024 * 1024;
 type ApiError = (StatusCode, &'static str);
@@ -33,7 +34,7 @@ trait Remote: Send + Sync {
 pub(crate) struct GitHubClient {
     client: reqwest::Client,
     token: Option<String>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "acceptance-fixture"))]
     fixture_origin: Option<String>,
 }
 
@@ -167,6 +168,21 @@ impl RemoteRepository {
 }
 impl GitHubClient {
     pub(crate) fn new() -> Result<Self, reqwest::Error> {
+        #[cfg(all(feature = "acceptance-fixture", not(test)))]
+        {
+            // Fixture binaries cannot contact production GitHub or use GitHub credentials.
+            let port = std::env::var("PANGGUNG_ACCEPTANCE_UPSTREAM_PORT")
+                .ok()
+                .and_then(|value| value.parse::<u16>().ok())
+                .filter(|port| *port != 0)
+                .expect("Acceptance fixture requires a numeric loopback port");
+            Ok(Self::loopback_fixture(port))
+        }
+        #[cfg(any(not(feature = "acceptance-fixture"), test))]
+        Self::production()
+    }
+    #[cfg(any(not(feature = "acceptance-fixture"), test))]
+    fn production() -> Result<Self, reqwest::Error> {
         let client = reqwest::Client::builder()
             .https_only(true)
             .redirect(reqwest::redirect::Policy::none())
@@ -181,11 +197,11 @@ impl GitHubClient {
         Ok(Self {
             client,
             token,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "acceptance-fixture"))]
             fixture_origin: None,
         })
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "acceptance-fixture"))]
     pub(crate) fn loopback_fixture(port: u16) -> Self {
         Self {
             client: reqwest::Client::builder()
@@ -252,7 +268,7 @@ impl GitHubClient {
         if !clean.len().is_multiple_of(4) {
             return Err(invalid);
         }
-        for (index, group) in clean.chunks_exact(4).enumerate() {
+        for (index, group) in clean.as_chunks::<4>().0.iter().enumerate() {
             let a = alphabet
                 .iter()
                 .position(|b| *b == group[0])
@@ -292,10 +308,15 @@ impl GitHubClient {
         crate::catalog::validate_descriptor(document).map_err(|_| invalid)
     }
     async fn get(&self, path: &str, query: &[(&str, String)]) -> Result<Option<Vec<u8>>, ApiError> {
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "acceptance-fixture")))]
         let origin = API;
         #[cfg(test)]
         let origin = self.fixture_origin.as_deref().unwrap_or(API);
+        #[cfg(all(feature = "acceptance-fixture", not(test)))]
+        let origin = self
+            .fixture_origin
+            .as_deref()
+            .expect("Fixture origin required");
         let mut request = self
             .client
             .get(format!("{origin}{path}"))

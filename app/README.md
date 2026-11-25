@@ -71,3 +71,7 @@ result cannot be established. All reservations remain unique and non-retryable.
 ### Signed webhook processing
 
 With the server signing secret configured, an administrator may enable ingestion and approve a registered repository by its numeric GitHub identifier. Receipts are deduplicated; approved hints enqueue bounded canonical read-only refreshes. A separate approval binds an existing catalog namespace, name and exact owner. Missing or mismatched descriptors never create or transfer a catalog entity. Revoke a source to cancel pending work and remove its catalog binding. Review processing history before re-approving. Unapproved receipts are not automatically processed after later approval. The worker uses bounded leases and retry delays; it never publishes to GitHub.
+
+### Controlled synchronization acceptance
+
+The optional `acceptance-fixture` Cargo feature is for debug acceptance executables only. It refuses release compilation, requires a numeric `PANGGUNG_ACCEPTANCE_UPSTREAM_PORT` on IPv4 loopback, rejects inherited GitHub credentials (except the synthetic webhook secret), and requires telemetry export disabled. The `--acceptance-fixture-check` command prints a marker before application initialization. Never distribute this fixture binary; ordinary builds use the fixed GitHub endpoint.

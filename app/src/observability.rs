@@ -40,6 +40,14 @@ struct Telemetry {
     operations: Counter<u64>,
     operation_duration: Histogram<f64>,
 }
+const MIN_TOKEN_LEN: usize = 32;
+const MAX_TOKEN_LEN: usize = 256;
+
+fn token_digest(value: &str) -> Option<[u8; 32]> {
+    ((MIN_TOKEN_LEN..=MAX_TOKEN_LEN).contains(&value.len())
+        && value.bytes().all(|b| b.is_ascii_graphic()))
+    .then(|| Sha256::digest(value.as_bytes()).into())
+}
 #[derive(Clone)]
 pub struct RequestTrace(Context);
 
@@ -116,6 +124,15 @@ impl Drop for OperationGuard {
     }
 }
 impl Telemetry {
+    fn optional(
+        export: bool,
+        initialize: impl FnOnce(bool) -> Result<Self, Box<dyn std::error::Error>>,
+    ) -> Self {
+        initialize(export).unwrap_or_else(|_| {
+            tracing::warn!("Optional telemetry exporter initialization failed; export disabled");
+            Self::new(false).expect("local telemetry initialization")
+        })
+    }
     fn new(export: bool) -> Result<Self, Box<dyn std::error::Error>> {
         let resource = Resource::builder().with_service_name("panggung").build();
         let mut meters = SdkMeterProvider::builder().with_resource(resource.clone());
@@ -180,23 +197,34 @@ impl Metrics {
             }
         };
         let scrape_token = match std::env::var("PANGGUNG_METRICS_TOKEN") {
-            Ok(value) if value.len() >= 32 && value.bytes().all(|b| b.is_ascii_graphic()) => {
-                Some(Sha256::digest(value.as_bytes()).into())
-            }
+            Ok(value) => Some(token_digest(&value).ok_or("PANGGUNG_METRICS_TOKEN must contain 32 to 256 printable non-space ASCII characters")?),
             Err(std::env::VarError::NotPresent) => None,
-            _ => return Err("PANGGUNG_METRICS_TOKEN must contain at least 32 printable non-space ASCII characters".into()),
+            _ => return Err("PANGGUNG_METRICS_TOKEN must contain 32 to 256 printable non-space ASCII characters".into()),
         };
         Ok(Self {
             snapshot: Mutex::default(),
             operation_counts: Mutex::default(),
-            telemetry: Telemetry::new(export).unwrap_or_else(|_| {
-                tracing::warn!(
-                    "Optional telemetry exporter initialization failed; export disabled"
-                );
-                Telemetry::new(false).expect("local telemetry initialization")
-            }),
+            telemetry: Telemetry::optional(export, Telemetry::new),
             scrape_token,
         })
+    }
+    /// Call once after the server and its operation workers have drained.
+    pub async fn shutdown(&self) {
+        let meter = self.telemetry._meter_provider.clone();
+        let tracer = self.telemetry._tracer_provider.clone();
+        if tokio::task::spawn_blocking(move || {
+            if meter.shutdown().is_err() {
+                tracing::warn!("Telemetry meter provider shutdown failed");
+            }
+            if tracer.shutdown().is_err() {
+                tracing::warn!("Telemetry tracer provider shutdown failed");
+            }
+        })
+        .await
+        .is_err()
+        {
+            tracing::warn!("Telemetry provider shutdown task failed");
+        }
     }
     pub fn operation(
         self: &Arc<Self>,
@@ -260,7 +288,7 @@ async fn scrape(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .ok_or(StatusCode::UNAUTHORIZED)?;
-    let actual = Sha256::digest(supplied.as_bytes());
+    let actual = token_digest(supplied).ok_or(StatusCode::UNAUTHORIZED)?;
     // Compare fixed-size digests without short-circuiting on a differing byte.
     if expected
         .iter()
@@ -401,7 +429,10 @@ mod tests {
     use axum::{body::Body, http::Request};
     use tower::ServiceExt;
     #[derive(Debug, Clone, Default)]
-    struct CaptureSpans(Arc<Mutex<Vec<opentelemetry_sdk::trace::SpanData>>>);
+    struct CaptureSpans(
+        Arc<Mutex<Vec<opentelemetry_sdk::trace::SpanData>>>,
+        Arc<std::sync::atomic::AtomicBool>,
+    );
     impl opentelemetry_sdk::trace::SpanExporter for CaptureSpans {
         async fn export(
             &self,
@@ -410,9 +441,19 @@ mod tests {
             self.0.lock().unwrap().extend(batch);
             Ok(())
         }
+        fn shutdown_with_timeout(
+            &mut self,
+            _: std::time::Duration,
+        ) -> opentelemetry_sdk::error::OTelSdkResult {
+            self.1.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
     }
     #[derive(Clone, Default)]
-    struct CaptureMetrics(Arc<Mutex<Vec<(String, u64)>>>);
+    struct CaptureMetrics(
+        Arc<Mutex<Vec<(String, u64)>>>,
+        Arc<std::sync::atomic::AtomicBool>,
+    );
     impl opentelemetry_sdk::metrics::exporter::PushMetricExporter for CaptureMetrics {
         async fn export(
             &self,
@@ -441,11 +482,79 @@ mod tests {
             &self,
             _: std::time::Duration,
         ) -> opentelemetry_sdk::error::OTelSdkResult {
+            self.1.store(true, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
         fn temporality(&self) -> opentelemetry_sdk::metrics::Temporality {
             opentelemetry_sdk::metrics::Temporality::Cumulative
         }
+    }
+    #[tokio::test]
+    async fn shutdown_flushes_and_stops_both_exporters() {
+        use std::sync::atomic::Ordering;
+        let spans = CaptureSpans::default();
+        let counts = CaptureMetrics::default();
+        let metrics = Arc::new(Metrics {
+            telemetry: Telemetry::from_providers(
+                SdkMeterProvider::builder()
+                    .with_periodic_exporter(counts.clone())
+                    .build(),
+                SdkTracerProvider::builder()
+                    .with_batch_exporter(spans.clone())
+                    .build(),
+            ),
+            ..Metrics::default()
+        });
+        metrics
+            .operation(Operation::Publish, None)
+            .finish(OperationOutcome::Success);
+        metrics.shutdown().await;
+        assert!(spans.1.load(Ordering::SeqCst));
+        assert!(counts.1.load(Ordering::SeqCst));
+        assert!(
+            spans
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|span| span.name == "panggung.publish")
+        );
+        assert!(
+            counts
+                .0
+                .lock()
+                .unwrap()
+                .contains(&("panggung.operation.count".to_owned(), 1))
+        );
+    }
+    #[test]
+    fn optional_exporter_failure_preserves_local_metrics() {
+        let telemetry = Telemetry::optional(true, |enabled| {
+            assert!(enabled);
+            Err("synthetic invalid exporter configuration".into())
+        });
+        let metrics = Arc::new(Metrics {
+            telemetry,
+            ..Metrics::default()
+        });
+        metrics
+            .operation(Operation::Webhook, None)
+            .finish(OperationOutcome::Success);
+        let (_, body) = render_metrics(&metrics);
+        assert!(
+            body.contains("panggung_operations_total{operation=\"webhook\",outcome=\"success\"} 1")
+        );
+    }
+    #[test]
+    fn token_digest_rejects_out_of_bounds_and_non_graphic_tokens() {
+        for len in [0, 31, 257, 4096] {
+            assert!(token_digest(&"a".repeat(len)).is_none());
+        }
+        for len in [32, 256] {
+            assert!(token_digest(&"a".repeat(len)).is_some());
+        }
+        assert!(token_digest(&" ".repeat(32)).is_none());
+        assert!(token_digest(&"é".repeat(32)).is_none());
     }
     #[tokio::test]
     async fn operations_emit_child_spans_and_scrape_counters() {
@@ -573,7 +682,12 @@ mod tests {
         });
         metrics.record(1000, true);
         let app = scrape_routes(metrics);
-        for authorization in ["Bearer wrong", "Basic wrong", ""] {
+        for authorization in [
+            "Bearer wrong".to_owned(),
+            "Basic wrong".to_owned(),
+            String::new(),
+            format!("Bearer {}", "a".repeat(257)),
+        ] {
             let response = app
                 .clone()
                 .oneshot(

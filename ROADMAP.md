@@ -63,4 +63,8 @@ No implementation phase is complete until actual checks have passed. Use phase-s
 
 - Phase 06: partial. Authenticated immutable template registry and administrator creation, five seeded stack definitions, bounded parameter schemas, pagination and integrated frontend. Scaffolding, ownership-specific permissions and publishing remain outstanding.
 
+- Phases 07-11: partial. Immutable scaffolder archives for five stacks, versioned documentation, embedded search, interface versions, scorecards, guarded GitHub publishing, signed webhook intake and approved canonical refresh implemented. Local baseline b2fa365: 62 Rust tests, 14 frontend tests, strict Clippy, debug build, mapping/browser acceptance and asset integrity passed. Remote workflow 45552716282 failed at a newer Clippy lint; no remote success claimed.
+- Phase 13: partial. Actual OpenTelemetry providers and emitted request/operation metrics and spans tested, authenticated opt-in scraping and Grafana provisioning implemented. Exporter operational deployment, full lifecycle and performance acceptance remain outstanding.
+- Standalone synthetic acceptance: controlled debug fixture executable verified member registration, administrator mapping, canonical retrieval, signed delivery, persisted entity/relationship updates, restart, replay and expired-lease recovery (isolated fixture). No external repositories mutated. Further conflict, saturation and security acceptance remains outstanding.
+
 Production readiness requires verified authentication, authorization, backup and restore, secure deployment, dependency review and documented operational limits. The current loopback-only preview is not a production release.
