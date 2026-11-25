@@ -73,7 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let docs_storage = storage::LocalStorage::open(config.data_dir.join("techdocs"))?;
     storage::validate_capabilities(&docs_storage)?;
     let docs_storage: Arc<dyn storage::ObjectStore> = Arc::new(docs_storage);
-    let metrics = Arc::new(observability::Metrics::default());
+    let metrics = Arc::new(observability::Metrics::from_env()?);
     let (webhook_management, webhook_receiver) = webhook::routes(pool.clone())?;
     let organization_routes = organization::routes(pool.clone())
         .merge(catalog_structure::routes(pool.clone()))
@@ -88,6 +88,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .merge(observability::routes(metrics.clone()))
         .merge(webhook_management)
         .merge(scorecards::routes(pool.clone(), docs_storage));
+    let webhook_worker = if std::env::var_os("PANGGUNG_GITHUB_WEBHOOK_SECRET").is_some() {
+        Some(webhook::start_worker(pool.clone(), metrics.clone())?)
+    } else {
+        None
+    };
     let repository: CatalogState = Arc::new(SqliteCatalogRepository::new(pool));
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, config.port)).await?;
     let auth = auth::AuthState::new(identity, listener.local_addr()?.port());
@@ -96,7 +101,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         listener,
         observability::instrument(
             production_router(repository, storage.routes(), organization_routes, auth)
-                .merge(webhook_receiver),
+                .merge(webhook_receiver)
+                .merge(observability::scrape_routes(metrics.clone())),
             metrics,
         ),
     )
@@ -104,6 +110,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = tokio::signal::ctrl_c().await;
     })
     .await?;
+    if let Some(worker) = webhook_worker {
+        worker.abort();
+        let _ = worker.await;
+    }
     Ok(())
 }
 

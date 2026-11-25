@@ -30,9 +30,11 @@ trait Remote: Send + Sync {
     fn fetch<'a>(&'a self, owner: &'a str, name: &'a str)
     -> RemoteFuture<'a, (Repository, String)>;
 }
-struct GitHubClient {
+pub(crate) struct GitHubClient {
     client: reqwest::Client,
     token: Option<String>,
+    #[cfg(test)]
+    fixture_origin: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -164,7 +166,7 @@ impl RemoteRepository {
     }
 }
 impl GitHubClient {
-    fn new() -> Result<Self, reqwest::Error> {
+    pub(crate) fn new() -> Result<Self, reqwest::Error> {
         let client = reqwest::Client::builder()
             .https_only(true)
             .redirect(reqwest::redirect::Policy::none())
@@ -176,12 +178,127 @@ impl GitHubClient {
         let token = std::env::var("PANGGUNG_GITHUB_TOKEN")
             .ok()
             .filter(|s| !s.is_empty());
-        Ok(Self { client, token })
+        Ok(Self {
+            client,
+            token,
+            #[cfg(test)]
+            fixture_origin: None,
+        })
+    }
+    #[cfg(test)]
+    pub(crate) fn loopback_fixture(port: u16) -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            token: None,
+            fixture_origin: Some(format!("http://127.0.0.1:{port}")),
+        }
+    }
+    pub(crate) async fn refresh_registered(
+        &self,
+        owner: &str,
+        name: &str,
+        id: i64,
+    ) -> Result<(Option<String>, String, bool, String), ApiError> {
+        let (repo, status) = self.fetch(owner, name).await?;
+        if repo.github_id != id {
+            return Err((StatusCode::CONFLICT, "Repository identity changed"));
+        }
+        Ok((repo.description, repo.default_branch, repo.archived, status))
+    }
+    pub(crate) async fn canonical_descriptor(
+        &self,
+        owner: &str,
+        name: &str,
+        branch: &str,
+    ) -> Result<crate::catalog::Component, ApiError> {
+        validate(owner, Some(name))?;
+        let invalid = (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Unsupported canonical descriptor",
+        );
+        let path = format!("/repos/{owner}/{name}/contents/catalog-info.yaml");
+        let body = self
+            .get(&path, &[("ref", branch.to_owned())])
+            .await?
+            .ok_or(invalid)?;
+        let value: serde_json::Value = serde_json::from_slice(&body).map_err(|_| invalid)?;
+        if value["type"] != "file"
+            || value["path"] != "catalog-info.yaml"
+            || value["encoding"] != "base64"
+            || !value["target"].is_null()
+            || !value["submodule_git_url"].is_null()
+        {
+            return Err(invalid);
+        }
+        let size = value["size"]
+            .as_u64()
+            .filter(|n| (1..=65536).contains(n))
+            .ok_or(invalid)?;
+        let encoded = value["content"]
+            .as_str()
+            .filter(|s| s.len() <= 100000)
+            .ok_or(invalid)?;
+        let mut bytes = Vec::with_capacity(size as usize);
+        let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let clean: Vec<u8> = encoded
+            .bytes()
+            .filter(|b| !b.is_ascii_whitespace())
+            .collect();
+        if !clean.len().is_multiple_of(4) {
+            return Err(invalid);
+        }
+        for (index, group) in clean.chunks_exact(4).enumerate() {
+            let a = alphabet
+                .iter()
+                .position(|b| *b == group[0])
+                .ok_or(invalid)? as u8;
+            let b = alphabet
+                .iter()
+                .position(|b| *b == group[1])
+                .ok_or(invalid)? as u8;
+            bytes.push((a << 2) | (b >> 4));
+            if group[2] == b'=' {
+                if group[3] != b'=' || index + 1 != clean.len() / 4 || b & 15 != 0 {
+                    return Err(invalid);
+                }
+                break;
+            }
+            let c = alphabet
+                .iter()
+                .position(|b| *b == group[2])
+                .ok_or(invalid)? as u8;
+            bytes.push((b << 4) | (c >> 2));
+            if group[3] == b'=' {
+                if index + 1 != clean.len() / 4 || c & 3 != 0 {
+                    return Err(invalid);
+                }
+                break;
+            }
+            let d = alphabet
+                .iter()
+                .position(|b| *b == group[3])
+                .ok_or(invalid)? as u8;
+            bytes.push((c << 6) | d);
+        }
+        if bytes.len() as u64 != size {
+            return Err(invalid);
+        }
+        let document = serde_yaml_ng::from_slice(&bytes).map_err(|_| invalid)?;
+        crate::catalog::validate_descriptor(document).map_err(|_| invalid)
     }
     async fn get(&self, path: &str, query: &[(&str, String)]) -> Result<Option<Vec<u8>>, ApiError> {
+        #[cfg(not(test))]
+        let origin = API;
+        #[cfg(test)]
+        let origin = self.fixture_origin.as_deref().unwrap_or(API);
         let mut request = self
             .client
-            .get(format!("{API}{path}"))
+            .get(format!("{origin}{path}"))
             .query(query)
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28");

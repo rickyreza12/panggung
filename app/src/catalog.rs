@@ -300,7 +300,7 @@ async fn import_document(
     ))
 }
 
-fn validate_descriptor(mut document: Value) -> Result<Component, ApiError> {
+pub(crate) fn validate_descriptor(mut document: Value) -> Result<Component, ApiError> {
     let invalid = (StatusCode::BAD_REQUEST, "Invalid component descriptor");
     reject_substitutions(&document, 0)?;
     if document.to_string().len() > MAX_DESCRIPTOR_BYTES {

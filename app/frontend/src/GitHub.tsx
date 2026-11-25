@@ -48,7 +48,7 @@ export default function GitHub({run,write,admin}:{run:typeof request;write:boole
     try {const saved=await run<Registered>('/api/github/sync',json('POST',{owner:repo.owner,repo:repo.name}));setNotice(saved.owner+'/'+saved.name+' synchronized.');setRefresh(n=>n+1);}
     catch(e){setSyncError(errorMessage(e));}finally{setBusy(false);}
   }
-  function row(repo:Repository){return <><strong>{repo.owner}/{repo.name}</strong>{repo.archived&&<span> · Archived</span>}<p>{repo.description||'No description provided.'}</p><small>Default branch: {repo.default_branch}</small></>;}
+  function row(repo:Repository){return <><strong>{repo.owner}/{repo.name}</strong>{repo.archived&&<span> · Archived</span>}<p>{repo.description||'No description provided.'}</p><small>Default branch: {repo.default_branch} ? Repository ID: {repo.github_id}</small></>;}
   return <>
     <div className="heading"><h1 ref={heading} tabIndex={-1}>GitHub repositories</h1><p>Discover public repositories and explicitly synchronize metadata into Panggung. Discovery is read-only. Administrators can explicitly authorize repository creation and project publication.</p></div>
     {notice&&<p role="status" className="notice">{notice}</p>}{syncError&&<p role="alert" className="error">{syncError}</p>}
@@ -95,8 +95,18 @@ function ArtifactPublishing({run}:{run:typeof request}){
 }
 
 interface WebhookStatus {enabled:boolean;secret_configured:boolean;accepted_deliveries:number;last_received_at:number|null}
+interface WebhookJob {id:number;owner:string;repo:string;state:string;attempts:number;outcome:string|null}
 function WebhookSettings({run}:{run:typeof request}){
   const [status,setStatus]=useState<WebhookStatus|null>(null);
+  const [jobs,setJobs]=useState<WebhookJob[]>([]);
+  const [offset,setOffset]=useState(0);
+  const [source,setSource]=useState('');
+  const [namespace,setNamespace]=useState('default');
+  const [name,setName]=useState('');
+  const [owner,setOwner]=useState('');
+  const [jobError,setJobError]=useState('');
+  const [message,setMessage]=useState('');
+
   const [error,setError]=useState('');
   const [busy,setBusy]=useState(false);
   const [refresh,setRefresh]=useState(0);
@@ -105,10 +115,39 @@ function WebhookSettings({run}:{run:typeof request}){
     run<WebhookStatus>('/api/webhooks/github/status',{signal:controller.signal}).then(value=>{if(!controller.signal.aborted){setStatus(value);setError('');}}).catch(e=>{if(!controller.signal.aborted)setError(errorMessage(e));});
     return ()=>controller.abort();
   },[run,refresh]);
+  useEffect(()=>{
+    const c=new AbortController();
+    run<WebhookJob[]>('/api/webhooks/github/jobs?offset='+offset,{signal:c.signal}).then(v=>{if(!c.signal.aborted){setJobs(v);setJobError('');}}).catch(e=>{if(!c.signal.aborted)setJobError(errorMessage(e));});
+    return ()=>c.abort();
+  },[run,refresh,offset]);
+  async function approve(action:'source'|'catalog'|'revoke'){
+    if(busy||!Number.isSafeInteger(Number(source))||Number(source)<=0)return;
+    setBusy(true);setError('');setMessage('');
+    try {
+      const path='/api/webhooks/github/'+(action==='catalog'?'catalog/':'sources/')+source;
+      await run(path,action==='catalog'?json('PUT',{namespace,name,owner}):{method:action==='revoke'?'DELETE':'PUT'});
+      setMessage(action==='revoke'?'Source revoked and pending jobs cancelled.':'Approval saved.');
+      setRefresh(n=>n+1);
+    }catch(e){setError(errorMessage(e));}finally{setBusy(false);}
+  }
   async function configure(enabled:boolean){
     setBusy(true);setError('');
     try{await run('/api/webhooks/github/config',json('PUT',{enabled}));setStatus(null);setRefresh(n=>n+1);}
     catch(e){setError(errorMessage(e));}finally{setBusy(false);}
   }
-  return <section className="panel section"><h2>GitHub webhook administration</h2><p>Receive signed delivery receipts at /api/webhooks/github. Automatic synchronization is not enabled. Configure the signing secret on the server, never in the browser.</p>{error&&<p role="alert" className="error">{error}</p>}{status?<><p role="status">Ingestion: {status.enabled?'Enabled':'Disabled'} · Signing secret: {status.secret_configured?'Configured':'Not configured'}</p><p>Unique accepted deliveries: {status.accepted_deliveries}</p><p>Last receipt: {status.last_received_at===null?'None':new Date(status.last_received_at*1000).toLocaleString()}</p><button disabled={busy||(!status.enabled&&!status.secret_configured)} onClick={()=>configure(!status.enabled)}>{status.enabled?'Disable ingestion':'Enable ingestion'}</button></>:!error?<p role="status">Loading webhook configuration…</p>:null}<button disabled={busy} onClick={()=>setRefresh(n=>n+1)}>Refresh webhook status</button></section>;
+  return <section className="panel section"><h2>GitHub webhook administration</h2><p>Receive signed delivery receipts at /api/webhooks/github. Only explicitly approved registered repositories can be refreshed. Catalog changes require an additional entity and owner approval. Configure the signing secret on the server, never in the browser.</p>{error&&<p role="alert" className="error">{error}</p>}{status?<><p role="status">Ingestion: {status.enabled?'Enabled':'Disabled'} · Signing secret: {status.secret_configured?'Configured':'Not configured'}</p><p>Unique accepted deliveries: {status.accepted_deliveries}</p><p>Last receipt: {status.last_received_at===null?'None':new Date(status.last_received_at*1000).toLocaleString()}</p><button disabled={busy||(!status.enabled&&!status.secret_configured)} onClick={()=>configure(!status.enabled)}>{status.enabled?'Disable ingestion':'Enable ingestion'}</button></>:!error?<p role="status">Loading webhook configuration…</p>:null}<button disabled={busy} onClick={()=>setRefresh(n=>n+1)}>Refresh webhook status</button>
+    <h3>Approved repository and catalog mapping</h3>
+    <form onSubmit={e=>{e.preventDefault();void approve('catalog');}}>
+      <label>Registered GitHub repository ID<input type="number" min={1} max={Number.MAX_SAFE_INTEGER} required value={source} onChange={e=>setSource(e.target.value)}/></label>
+      <div className="actions"><button type="button" disabled={busy||!source} onClick={()=>approve('source')}>Approve repository</button><button type="button" disabled={busy||!source} onClick={()=>approve('revoke')}>Revoke repository</button></div>
+      <label>Existing catalog namespace<input required maxLength={63} value={namespace} onChange={e=>setNamespace(e.target.value)}/></label>
+      <label>Existing catalog name<input required maxLength={63} value={name} onChange={e=>setName(e.target.value)}/></label>
+      <label>Exact existing catalog owner<input required maxLength={100} value={owner} onChange={e=>setOwner(e.target.value)}/></label>
+      <button disabled={busy||!source||!namespace||!name||!owner}>Approve catalog target</button>
+    </form>
+    {message&&<p role="status">{message}</p>}
+    <h3>Processing history</h3>
+    {jobError?<p role="alert" className="error">{jobError}</p>:jobs.length?<ul className="relations">{jobs.map(job=><li key={job.id}><strong>{job.owner}/{job.repo}</strong><span>{job.state} ? Attempts {job.attempts} ? {job.outcome||'Awaiting processing'}</span></li>)}</ul>:<p>No processing jobs on this page.</p>}
+    <div className="actions"><button disabled={offset===0} onClick={()=>setOffset(n=>Math.max(0,n-20))}>Previous jobs</button><button disabled={jobs.length<20||offset>=10000} onClick={()=>setOffset(n=>n+20)}>Next jobs</button><button onClick={()=>setRefresh(n=>n+1)}>Refresh jobs</button></div>
+  </section>;
 }

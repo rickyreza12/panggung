@@ -488,11 +488,14 @@ pub fn routes(pool: SqlitePool) -> Result<Router, reqwest::Error> {
 }
 fn router(state: StateData) -> Router {
     Router::new()
-        .route("/api/github/artifact-publish", get(list).post(publish))
+        .route(
+            "/api/github/artifact-publish",
+            get(list).post(observed_publish),
+        )
         .route("/api/github/artifact-publish/{job}", get(detail))
         .route(
             "/api/github/artifact-publish/{job}/reconcile",
-            post(reconcile),
+            post(observed_reconcile),
         )
         .layer(DefaultBodyLimit::max(2048))
         .with_state(state)
@@ -537,6 +540,27 @@ async fn detail(
     .map_err(db)?
     .map(Json)
     .ok_or((StatusCode::NOT_FOUND, "Publication not found"))
+}
+async fn observed_reconcile(
+    State(state): State<StateData>,
+    Extension(user): Extension<User>,
+    metrics: Option<Extension<std::sync::Arc<crate::observability::Metrics>>>,
+    trace: Option<Extension<crate::observability::RequestTrace>>,
+    Path(job): Path<i64>,
+) -> Result<Json<Record>, Error> {
+    use crate::observability::{Operation, OperationOutcome};
+    let guard = metrics
+        .as_ref()
+        .map(|Extension(m)| m.operation(Operation::Publish, trace.as_ref().map(|Extension(t)| t)));
+    let result = reconcile(State(state), Extension(user), Path(job)).await;
+    if let Some(g) = guard {
+        g.finish(match &result {
+            Ok(_) => OperationOutcome::Success,
+            Err((status, _)) if status.is_client_error() => OperationOutcome::Rejected,
+            _ => OperationOutcome::Failure,
+        });
+    }
+    result
 }
 async fn reconcile(
     State(state): State<StateData>,
@@ -591,6 +615,27 @@ async fn reconcile(
     }
     detail(State(state), Extension(user), Path(job)).await
 }
+async fn observed_publish(
+    State(state): State<StateData>,
+    Extension(user): Extension<User>,
+    metrics: Option<Extension<std::sync::Arc<crate::observability::Metrics>>>,
+    trace: Option<Extension<crate::observability::RequestTrace>>,
+    Json(input): Json<Input>,
+) -> Result<Json<Record>, Error> {
+    use crate::observability::{Operation, OperationOutcome};
+    let guard = metrics
+        .as_ref()
+        .map(|Extension(m)| m.operation(Operation::Publish, trace.as_ref().map(|Extension(t)| t)));
+    let result = publish(State(state), Extension(user), Json(input)).await;
+    if let Some(g) = guard {
+        g.finish(match &result {
+            Ok(_) => OperationOutcome::Success,
+            Err((status, _)) if status.is_client_error() => OperationOutcome::Rejected,
+            _ => OperationOutcome::Failure,
+        });
+    }
+    result
+}
 async fn publish(
     State(state): State<StateData>,
     Extension(user): Extension<User>,
@@ -618,13 +663,20 @@ async fn publish(
         StatusCode::SERVICE_UNAVAILABLE,
         "Artifact publishing disabled",
     ))?;
-    let mut tx = state.pool.begin().await.map_err(db)?;
+    let mut tx = state.pool.begin_with("BEGIN IMMEDIATE").await.map_err(db)?;
     // Require the same administrator to own the generated job and destination creation.
     let row:Option<(i64,String)>=sqlx::query_as("SELECT p.github_id,j.artifact FROM github_publish_attempts p JOIN scaffolder_jobs j ON j.id=? WHERE p.owner=? AND p.repo=? AND p.state='succeeded' AND p.actor_id=? AND j.actor_id=?").bind(input.job_id).bind(&owner).bind(&repo).bind(user.id).bind(user.id).fetch_optional(&mut *tx).await.map_err(db)?;
     let (id, body) = row.ok_or((
         StatusCode::NOT_FOUND,
         "Owned job or successful repository creation not found",
     ))?;
+    let reserved: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM github_artifact_publications WHERE job_id=? OR (owner=? AND repo=?))").bind(input.job_id).bind(&owner).bind(&repo).fetch_one(&mut *tx).await.map_err(db)?;
+    if reserved {
+        return Err((
+            StatusCode::CONFLICT,
+            "Job or destination already reserved; inspect history",
+        ));
+    }
     let files = publication_files(&body)?;
     let inserted=sqlx::query("INSERT INTO github_artifact_publications(owner,repo,job_id,actor_id,state,baseline_sha,repository_id,manifest_digest,mutation_stage) VALUES(?,?,?,?,'uncertain',?,?,?,'reserved') ON CONFLICT DO NOTHING").bind(&owner).bind(&repo).bind(input.job_id).bind(user.id).bind(&input.baseline).bind(id).bind(format!("{:x}",Sha256::digest(body.as_bytes()))).execute(&mut *tx).await.map_err(db)?;
     if inserted.rows_affected() == 0 {
@@ -1083,6 +1135,81 @@ mod tests {
             confirmation: format!("allowed/{repo}@{baseline}#{job_id}"),
             baseline,
         }
+    }
+    #[tokio::test]
+    async fn concurrent_publications_reserve_job_and_destination_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = crate::database::open(&dir.path().join("duplicate.db"))
+            .await
+            .unwrap();
+        let user = IdentityStore::new(pool.clone())
+            .bootstrap_admin("admin", "synthetic-test-password-123")
+            .await
+            .unwrap();
+        let template: (String, String) = sqlx::query_as(
+            "SELECT name,version FROM software_template_versions WHERE stack='python' LIMIT 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let artifact = json!({"name":"python-starter","version":"1.0.0","stack":"python","files":{"README.md":"synthetic","panggung.json":"{}","main.py":"print('synthetic')"}}).to_string();
+        for job in 1..=5_i64 {
+            sqlx::query(
+                "INSERT INTO scaffolder_jobs(id,actor_id,name,version,artifact) VALUES(?,?,?,?,?)",
+            )
+            .bind(job)
+            .bind(user.id)
+            .bind(&template.0)
+            .bind(&template.1)
+            .bind(&artifact)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        for repo in ["same", "job-a", "job-b", "destination"] {
+            sqlx::query("INSERT INTO github_publish_attempts(owner,repo,state,github_id,actor_id,completed_at) VALUES('allowed',?,'succeeded',123,?,unixepoch())")
+                .bind(repo).bind(user.id).execute(&pool).await.unwrap();
+        }
+        let fake = Arc::new(Fake(AtomicUsize::new(0)));
+        let state = StateData {
+            pool: pool.clone(),
+            remote: Some(fake.clone()),
+            orgs: vec!["allowed".into()],
+            destinations: ["same", "job-a", "job-b", "destination"]
+                .map(|repo| format!("allowed/{repo}"))
+                .to_vec(),
+        };
+        for (left, right) in [
+            (input(1, "same"), input(1, "same")),
+            (input(2, "job-a"), input(2, "job-b")),
+            (input(3, "destination"), input(4, "destination")),
+        ] {
+            let calls_before = fake.0.load(Ordering::SeqCst);
+            let (left, right) = tokio::join!(
+                publish(State(state.clone()), Extension(user.clone()), Json(left)),
+                publish(State(state.clone()), Extension(user.clone()), Json(right)),
+            );
+            match (left, right) {
+                (Ok(Json(record)), Err((StatusCode::CONFLICT, _)))
+                | (Err((StatusCode::CONFLICT, _)), Ok(Json(record))) => {
+                    assert_eq!(record.state, "succeeded");
+                }
+                _ => panic!("exactly one publication must succeed and the duplicate must conflict"),
+            }
+            assert_eq!(fake.0.load(Ordering::SeqCst), calls_before + 1);
+        }
+        let confirmed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM github_artifact_publications WHERE state='succeeded' AND mutation_stage='confirmed' AND commit_sha=candidate_sha")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(confirmed, 3);
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM github_artifact_publications")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(total, 3);
+        let reservations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM identity_audit_events WHERE action LIKE 'artifact_publish_reserved:%'")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(reservations, 3);
+        pool.close().await;
     }
     #[tokio::test]
     async fn publication_reservation_is_authorized_and_survives_restart() {

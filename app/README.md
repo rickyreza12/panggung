@@ -67,3 +67,7 @@ deletion and concurrent writers; non-force updates alone cannot exclude races.
 Outcomes: confirmed means verified; rejected means no branch update was
 attempted; conflict means divergent remote evidence; unresolved means the
 result cannot be established. All reservations remain unique and non-retryable.
+
+### Signed webhook processing
+
+With the server signing secret configured, an administrator may enable ingestion and approve a registered repository by its numeric GitHub identifier. Receipts are deduplicated; approved hints enqueue bounded canonical read-only refreshes. A separate approval binds an existing catalog namespace, name and exact owner. Missing or mismatched descriptors never create or transfer a catalog entity. Revoke a source to cancel pending work and remove its catalog binding. Review processing history before re-approving. Unapproved receipts are not automatically processed after later approval. The worker uses bounded leases and retry delays; it never publishes to GitHub.
