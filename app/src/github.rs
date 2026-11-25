@@ -371,10 +371,10 @@ async fn sync(
     let mut tx = state.pool.begin().await.map_err(db_error)?;
     let saved=sqlx::query_as::<_,Registered>(
         "INSERT INTO github_repositories(github_id,owner,name,description,default_branch,archived,descriptor_status,synced_by) VALUES(?,?,?,?,?,?,?,?)
-         ON CONFLICT(github_id) DO UPDATE SET owner=excluded.owner,name=excluded.name,description=excluded.description,default_branch=excluded.default_branch,archived=excluded.archived,descriptor_status=excluded.descriptor_status,synced_by=excluded.synced_by,synced_at=unixepoch()
+         ON CONFLICT(github_id) DO UPDATE SET owner=excluded.owner,name=excluded.name,description=excluded.description,default_branch=excluded.default_branch,archived=excluded.archived,descriptor_status=excluded.descriptor_status,synced_at=unixepoch() WHERE github_repositories.synced_by=excluded.synced_by OR ?
          RETURNING github_id,owner,name,description,default_branch,archived,descriptor_status,synced_at,synced_by")
-        .bind(repo.github_id).bind(&repo.owner).bind(&repo.name).bind(&repo.description).bind(&repo.default_branch).bind(repo.archived).bind(status).bind(user.id)
-        .fetch_one(&mut *tx).await.map_err(db_error)?;
+        .bind(repo.github_id).bind(&repo.owner).bind(&repo.name).bind(&repo.description).bind(&repo.default_branch).bind(repo.archived).bind(status).bind(user.id).bind(user.role == Role::Admin)
+        .fetch_optional(&mut *tx).await.map_err(db_error)?.ok_or((StatusCode::FORBIDDEN, "Repository registration belongs to another user"))?;
     sqlx::query("INSERT INTO identity_audit_events(actor_id,action) VALUES(?,?)")
         .bind(user.id)
         .bind(format!("sync_github:{}/{}", repo.owner, repo.name))
@@ -485,6 +485,12 @@ mod tests {
             .await
             .unwrap();
         let member_token = identity.login("member", &password).await.unwrap();
+        let admin_token = identity.login("admin", &password).await.unwrap();
+        identity
+            .create_user(admin.id, "other", &password, Role::Member)
+            .await
+            .unwrap();
+        let other_token = identity.login("other", &password).await.unwrap();
         let viewer_token = identity.login("viewer", &password).await.unwrap();
         let app = auth::protect(
             router(GitHubState {
@@ -538,6 +544,16 @@ mod tests {
             call(&app, "POST", "/api/github/sync", writer, body).await.0,
             StatusCode::OK
         );
+        assert_eq!(
+            call(&app, "POST", "/api/github/sync", other_token.as_str(), body)
+                .await
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        let (status, record) =
+            call(&app, "POST", "/api/github/sync", admin_token.as_str(), body).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(record["synced_by"], member.id);
         drop(app);
         pool.close().await;
         let pool = crate::database::open(&path).await.unwrap();
@@ -563,6 +579,6 @@ mod tests {
         .fetch_all(&pool)
         .await
         .unwrap();
-        assert_eq!(actors, vec![member.id, member.id]);
+        assert_eq!(actors, vec![member.id, member.id, admin.id]);
     }
 }

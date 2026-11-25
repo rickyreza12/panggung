@@ -9,20 +9,37 @@ use axum::{
 };
 use rand_core::{OsRng, RngCore};
 use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, Mutex},
     time::Instant,
 };
 use tracing::Instrument;
 
 #[derive(Default)]
 pub struct Metrics {
-    requests: AtomicU64,
-    failures: AtomicU64,
-    duration_micros: AtomicU64,
-    buckets: [AtomicU64; 8],
+    snapshot: Mutex<Snapshot>,
+}
+#[derive(Default, Clone, Copy)]
+struct Snapshot {
+    requests: u64,
+    failures: u64,
+    duration_micros: u64,
+    buckets: [u64; 8],
+}
+impl Metrics {
+    fn record(&self, micros: u64, failed: bool) {
+        let mut s = self.snapshot.lock().unwrap_or_else(|e| e.into_inner());
+        s.requests = s.requests.saturating_add(1);
+        s.failures = s.failures.saturating_add(u64::from(failed));
+        s.duration_micros = s.duration_micros.saturating_add(micros);
+        for (bound, count) in BUCKETS.iter().zip(&mut s.buckets) {
+            if micros <= *bound {
+                *count = count.saturating_add(1);
+            }
+        }
+    }
+    fn read(&self) -> Snapshot {
+        *self.snapshot.lock().unwrap_or_else(|e| e.into_inner())
+    }
 }
 const BUCKETS: [u64; 8] = [5000, 10000, 25000, 50000, 100000, 250000, 1000000, 5000000];
 pub fn routes(metrics: Arc<Metrics>) -> Router {
@@ -52,16 +69,7 @@ async fn observe(State(metrics): State<Arc<Metrics>>, request: Request, next: Ne
     let mut response = next.run(request).instrument(span.clone()).await;
     span.record("status", response.status().as_u16());
     let micros = started.elapsed().as_micros().min(u64::MAX as u128) as u64;
-    metrics.requests.fetch_add(1, Ordering::Relaxed);
-    metrics.duration_micros.fetch_add(micros, Ordering::Relaxed);
-    for (bound, count) in BUCKETS.iter().zip(&metrics.buckets) {
-        if micros <= *bound {
-            count.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-    if response.status().is_server_error() {
-        metrics.failures.fetch_add(1, Ordering::Relaxed);
-    }
+    metrics.record(micros, response.status().is_server_error());
     tracing::info!(request_id=%id,method=%method,status=response.status().as_u16(),duration_micros=micros,"request completed");
     if let Ok(value) = HeaderValue::from_str(&id) {
         response.headers_mut().insert("x-request-id", value);
@@ -75,10 +83,10 @@ async fn metrics_text(
     if user.role != Role::Admin {
         return Err(StatusCode::FORBIDDEN);
     }
+    let metrics = metrics.read();
     let mut output = format!(
         "# HELP panggung_http_requests_total Completed requests.\n# TYPE panggung_http_requests_total counter\npanggung_http_requests_total {}\n# HELP panggung_http_server_errors_total Server errors.\n# TYPE panggung_http_server_errors_total counter\npanggung_http_server_errors_total {}\n# HELP panggung_http_request_duration_seconds Request duration in seconds.\n# TYPE panggung_http_request_duration_seconds histogram\n",
-        metrics.requests.load(Ordering::Relaxed),
-        metrics.failures.load(Ordering::Relaxed)
+        metrics.requests, metrics.failures
     );
     use std::fmt::Write;
     for (bound, count) in BUCKETS.iter().zip(&metrics.buckets) {
@@ -86,14 +94,14 @@ async fn metrics_text(
             output,
             "panggung_http_request_duration_seconds_bucket{{le=\"{}\"}} {}",
             *bound as f64 / 1_000_000.0,
-            count.load(Ordering::Relaxed)
+            count
         );
     }
-    let count = metrics.requests.load(Ordering::Relaxed);
+    let count = metrics.requests;
     let _ = writeln!(
         output,
         "panggung_http_request_duration_seconds_bucket{{le=\"+Inf\"}} {count}\npanggung_http_request_duration_seconds_count {count}\npanggung_http_request_duration_seconds_sum {:.6}",
-        metrics.duration_micros.load(Ordering::Relaxed) as f64 / 1_000_000.0
+        metrics.duration_micros as f64 / 1_000_000.0
     );
     Ok((
         [(
@@ -109,6 +117,26 @@ mod tests {
     use super::*;
     use axum::{body::Body, http::Request};
     use tower::ServiceExt;
+    #[test]
+    fn concurrent_snapshots_are_consistent() {
+        let metrics = Metrics::default();
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    for _ in 0..1000 {
+                        metrics.record(1000, true);
+                    }
+                });
+            }
+            for _ in 0..1000 {
+                let s = metrics.read();
+                assert_eq!(s.requests, s.failures);
+                assert_eq!(s.duration_micros, s.requests * 1000);
+                assert_eq!(s.buckets, [s.requests; 8]);
+            }
+        });
+        assert_eq!(metrics.read().requests, 4000);
+    }
     #[tokio::test]
     async fn counts_responses_and_replaces_untrusted_request_id() {
         let metrics = Arc::new(Metrics::default());
@@ -131,7 +159,7 @@ mod tests {
             response.headers()["x-request-id"].to_str().unwrap().len(),
             32
         );
-        assert_eq!(metrics.requests.load(Ordering::Relaxed), 1);
-        assert_eq!(metrics.failures.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.read().requests, 1);
+        assert_eq!(metrics.read().failures, 1);
     }
 }
