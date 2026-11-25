@@ -112,14 +112,14 @@ struct Page {
     has_more: bool,
 }
 
-fn valid_owner(v: &str) -> bool {
+pub(crate) fn valid_owner(v: &str) -> bool {
     (1..=39).contains(&v.len())
         && v.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
         && v.as_bytes()[0].is_ascii_alphanumeric()
         && v.as_bytes()[v.len() - 1].is_ascii_alphanumeric()
         && !v.contains("--")
 }
-fn valid_repo(v: &str) -> bool {
+pub(crate) fn valid_repo(v: &str) -> bool {
     (1..=100).contains(&v.len())
         && v != "."
         && v != ".."

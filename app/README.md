@@ -30,3 +30,40 @@ The descriptor reference is https://backstage.io/docs/features/software-catalog/
 ## Frontend distribution
 
 The React/TypeScript source lives in `app/frontend/`. Install with `npm ci --legacy-peer-deps`, verify with `npm run typecheck`, `npm run lint`, `npm run test`, and `npm run build`. Run `node app/scripts/sync-frontend.mjs` from the repository root to copy the production build into `app/src/web/` for embedding in the Rust executable.
+
+## Guarded generated-project publication
+
+Disabled by default. Set PANGGUNG_GITHUB_PUBLISH_ORGS (comma-separated approved
+organizations), PANGGUNG_GITHUB_ARTIFACT_DESTINATIONS (exact owner/repository
+pairs), and PANGGUNG_GITHUB_ARTIFACT_TOKEN (a separate server-only credential
+restricted to approved repositories with contents read/write access). Do not
+place credentials in frontend configuration or source control.
+
+An administrator must own both the saved scaffolder job and the successful
+repository creation record. Creation does not initialize the repository.
+Using authorized Git administration tools, prepare an initialized main branch
+with an empty commit and no files (for example git commit --allow-empty in
+a newly initialized empty local repository). Verify the private destination
+and push that initial branch explicitly. A README or other file in the
+baseline is not accepted. Record its exact 40-character commit identifier.
+In Panggung confirm owner/repository@baseline#job_id exactly.
+
+Publication reserves the job and destination before contacting GitHub,
+then records the candidate commit and tree before attempting a non-force
+branch update. Never allow other writers or branch resets during publication:
+the GitHub non-force reference operation is not a compare-and-swap.
+A rejected reservation remains reserved. An uncertain candidate can be
+checked with Reconcile read-only; this checks repository identity, branch,
+parent, tree and stored file contents without repeating a write.
+If recovery cannot verify the candidate, retain the reservation and
+escalate to the repository administrator. Legacy reservations without
+candidate evidence cannot be recovered automatically. Do not delete
+reservation rows to retry. Standalone operation requires no GitHub credential.
+
+Candidate parent, tree and exact file contents are checked before the reference
+update and again afterward. The final reference is reread before confirmation.
+Configure administrator-controlled branch rules to prohibit force updates,
+deletion and concurrent writers; non-force updates alone cannot exclude races.
+Outcomes: confirmed means verified; rejected means no branch update was
+attempted; conflict means divergent remote evidence; unresolved means the
+result cannot be established. All reservations remain unique and non-retryable.

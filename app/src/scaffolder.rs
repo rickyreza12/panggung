@@ -38,11 +38,38 @@ struct Definition {
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 struct Artifact {
     name: String,
     version: String,
     stack: String,
+    #[serde(deserialize_with = "unique_files")]
     files: BTreeMap<String, String>,
+}
+
+fn unique_files<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<BTreeMap<String, String>, D::Error> {
+    struct Visitor;
+    impl<'de> serde::de::Visitor<'de> for Visitor {
+        type Value = BTreeMap<String, String>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("unique file paths")
+        }
+        fn visit_map<M: serde::de::MapAccess<'de>>(
+            self,
+            mut map: M,
+        ) -> Result<Self::Value, M::Error> {
+            let mut files = BTreeMap::new();
+            while let Some((k, v)) = map.next_entry::<String, String>()? {
+                if files.insert(k, v).is_some() {
+                    return Err(serde::de::Error::custom("Duplicate file path"));
+                }
+            }
+            Ok(files)
+        }
+    }
+    d.deserialize_map(Visitor)
 }
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
@@ -332,6 +359,16 @@ fn allowed_paths(stack: &str) -> Option<&'static [&'static str]> {
         ]),
         _ => None,
     }
+}
+
+/// Publishing and archive generation share the same immutable artifact contract.
+pub(crate) fn publication_files(body: &str) -> Result<BTreeMap<String, String>, Error> {
+    if body.len() > 512 * 1024 {
+        return Err(ARCHIVE_ERROR);
+    }
+    let artifact: Artifact = serde_json::from_str(body).map_err(|_| ARCHIVE_ERROR)?;
+    archive(&artifact)?;
+    Ok(artifact.files)
 }
 
 fn archive(artifact: &Artifact) -> Result<Vec<u8>, Error> {

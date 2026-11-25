@@ -1,3 +1,4 @@
+mod artifact_publish;
 mod auth;
 mod catalog;
 mod catalog_relations;
@@ -83,6 +84,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .merge(interfaces::routes(pool.clone()))
         .merge(github::routes(pool.clone())?)
         .merge(publish::routes(pool.clone())?)
+        .merge(artifact_publish::routes(pool.clone())?)
         .merge(observability::routes(metrics.clone()))
         .merge(webhook_management)
         .merge(scorecards::routes(pool.clone(), docs_storage));
